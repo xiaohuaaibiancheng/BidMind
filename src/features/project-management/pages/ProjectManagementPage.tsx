@@ -34,49 +34,6 @@ interface ProjectManagementPageProps {
   onOpenProject: (projectId: string, section: ProjectWorkbenchType) => void;
 }
 
-const seedProjects: ManagedProject[] = [
-  {
-    id: 'proj-seed-001',
-    name: '智慧园区综合运维服务项目',
-    code: 'YM-2026-001',
-    owner: '技术一组',
-    workbench: 'technical-plan',
-    status: 'in-progress',
-    created_at: '2026-05-08T10:00:00.000Z',
-    updated_at: '2026-05-22T09:30:00.000Z',
-  },
-  {
-    id: 'proj-seed-002',
-    name: '产业园设备采购项目商务响应',
-    code: 'YM-2026-004',
-    owner: '商务组',
-    workbench: 'business-bid',
-    status: 'in-progress',
-    created_at: '2026-05-11T08:20:00.000Z',
-    updated_at: '2026-05-21T16:20:00.000Z',
-  },
-  {
-    id: 'proj-seed-003',
-    name: '医院后勤信息化建设项目',
-    code: 'YM-2026-006',
-    owner: '医疗行业组',
-    workbench: 'technical-plan',
-    status: 'completed',
-    created_at: '2026-04-18T07:10:00.000Z',
-    updated_at: '2026-05-17T10:15:00.000Z',
-  },
-  {
-    id: 'proj-seed-004',
-    name: '轨道交通站点智慧安防商务标',
-    code: 'YM-2026-002',
-    owner: '交通行业组',
-    workbench: 'business-bid',
-    status: 'deleted',
-    created_at: '2026-04-01T11:00:00.000Z',
-    updated_at: '2026-05-14T02:40:00.000Z',
-  },
-];
-
 function normalizeState(state: unknown): ProjectWorkspaceState {
   const projects = (state as ProjectWorkspaceState | null)?.projects;
   if (!Array.isArray(projects)) {
@@ -161,16 +118,12 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
       .then((state) => {
         if (canceled) return;
         const normalized = normalizeState(state);
-        if (normalized.projects.length > 0) {
-          setWorkspace(normalized);
-        } else {
-          setWorkspace({ projects: seedProjects });
-        }
+        setWorkspace(normalized);
         hydratedRef.current = true;
       })
       .catch((error) => {
         if (canceled) return;
-        setWorkspace({ projects: seedProjects });
+        setWorkspace({ projects: [] });
         hydratedRef.current = true;
         showToast(error instanceof Error ? error.message : '读取项目数据失败', 'error');
       });
