@@ -1,0 +1,199 @@
+const https = require('node:https');
+
+const LATEST_RELEASE_API = 'https://api.github.com/repos/FB208/BidMind/releases/latest';
+
+let autoUpdaterInstance = null;
+let downloadedUpdateVersion = '';
+let activeUpdateCheckPromise = null;
+
+function compareVersions(a, b) {
+  const pa = String(a || '').replace(/^v/, '').split('.').map(Number);
+  const pb = String(b || '').replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const na = Number.isFinite(pa[i]) ? pa[i] : 0;
+    const nb = Number.isFinite(pb[i]) ? pb[i] : 0;
+    if (na > nb) return 1;
+    if (na < nb) return -1;
+  }
+  return 0;
+}
+
+function fetchLatestRelease() {
+  return new Promise((resolve, reject) => {
+    const request = https.get(LATEST_RELEASE_API, { headers: { 'User-Agent': 'bidmind' } }, (response) => {
+      let data = '';
+      response.on('data', (chunk) => { data += chunk; });
+      response.on('end', () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`GitHub API 请求失败：${response.statusCode}`));
+          return;
+        }
+
+        try {
+          const release = JSON.parse(data);
+          resolve({
+            version: release.tag_name?.replace(/^v/, '') || '',
+            body: release.body || '',
+          });
+        } catch {
+          reject(new Error('解析 GitHub API 响应失败'));
+        }
+      });
+    });
+    request.on('error', (error) => reject(error));
+    request.setTimeout(10000, () => {
+      request.destroy();
+      reject(new Error('请求超时'));
+    });
+  });
+}
+
+function formatErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error || '未知错误');
+}
+
+function setProgressBar(mainWindow, progress) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  mainWindow.setProgressBar(progress);
+}
+
+function getDisabledResult() {
+  return { enabled: false, updateAvailable: false };
+}
+
+async function runUpdateCheck({ app, mainWindow, onProgress, onDownloaded, onError }) {
+  const release = await fetchLatestRelease();
+  if (!release.version || compareVersions(release.version, app.getVersion()) <= 0) {
+    return { enabled: true, updateAvailable: false };
+  }
+
+  let downloadedVersion = release.version;
+  let downloadedNotified = false;
+  let errorNotified = false;
+  const notifyError = (message) => {
+    if (errorNotified) {
+      return;
+    }
+    errorNotified = true;
+    onError?.(message);
+  };
+
+  const handleProgress = (progress) => {
+    const percent = Number(progress?.percent || 0);
+    setProgressBar(mainWindow, Math.max(0, Math.min(1, percent / 100)));
+    onProgress?.(percent);
+  };
+
+  const handleDownloaded = (info) => {
+    downloadedVersion = info?.version || release.version;
+    downloadedUpdateVersion = downloadedVersion;
+    downloadedNotified = true;
+    setProgressBar(mainWindow, -1);
+    onDownloaded?.(downloadedVersion);
+  };
+
+  const handleError = (error) => {
+    setProgressBar(mainWindow, -1);
+    notifyError(formatErrorMessage(error));
+  };
+
+  autoUpdaterInstance.on('download-progress', handleProgress);
+  autoUpdaterInstance.on('update-downloaded', handleDownloaded);
+  autoUpdaterInstance.on('error', handleError);
+
+  try {
+    const result = await autoUpdaterInstance.checkForUpdates();
+    if (!result) {
+      throw new Error('未找到可下载的更新包');
+    }
+
+    await autoUpdaterInstance.downloadUpdate();
+    downloadedUpdateVersion = downloadedVersion;
+    setProgressBar(mainWindow, -1);
+    if (!downloadedNotified) {
+      onDownloaded?.(downloadedVersion);
+    }
+    return { enabled: true, updateAvailable: true, version: downloadedVersion, downloaded: true };
+  } catch (error) {
+    const message = formatErrorMessage(error);
+    notifyError(message);
+    return { enabled: true, updateAvailable: true, version: release.version, failed: true, message };
+  } finally {
+    autoUpdaterInstance.removeListener('download-progress', handleProgress);
+    autoUpdaterInstance.removeListener('update-downloaded', handleDownloaded);
+    autoUpdaterInstance.removeListener('error', handleError);
+    setProgressBar(mainWindow, -1);
+  }
+}
+
+async function checkAndDownloadUpdate(options = {}) {
+  const { app } = options;
+  if (!app?.isPackaged) {
+    return getDisabledResult();
+  }
+  if (!autoUpdaterInstance) {
+    return { enabled: true, updateAvailable: false, failed: true, message: '自动更新未初始化' };
+  }
+  if (downloadedUpdateVersion) {
+    return { enabled: true, updateAvailable: true, version: downloadedUpdateVersion, downloaded: true };
+  }
+  if (activeUpdateCheckPromise) {
+    return activeUpdateCheckPromise;
+  }
+
+  activeUpdateCheckPromise = runUpdateCheck(options)
+    .catch((error) => {
+      const message = formatErrorMessage(error);
+      options.onError?.(message);
+      return { enabled: true, updateAvailable: false, failed: true, message };
+    })
+    .finally(() => {
+      activeUpdateCheckPromise = null;
+    });
+  return activeUpdateCheckPromise;
+}
+
+function triggerUpdateDownload(options) {
+  return checkAndDownloadUpdate(options);
+}
+
+function quitAndInstall() {
+  if (autoUpdaterInstance && downloadedUpdateVersion) {
+    autoUpdaterInstance.quitAndInstall(false, true);
+  }
+}
+
+function setupAutoUpdate({ app, mainWindow }) {
+  if (!app.isPackaged) {
+    return;
+  }
+
+  const { autoUpdater } = require('electron-updater');
+  autoUpdaterInstance = autoUpdater;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+
+  autoUpdater.on('download-progress', (progress) => {
+    const percent = Number(progress?.percent || 0);
+    setProgressBar(mainWindow, Math.max(0, Math.min(1, percent / 100)));
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    downloadedUpdateVersion = info?.version || downloadedUpdateVersion;
+    setProgressBar(mainWindow, -1);
+  });
+
+  autoUpdater.on('error', (error) => {
+    setProgressBar(mainWindow, -1);
+    console.warn('自动更新检查失败', error);
+  });
+}
+
+module.exports = {
+  setupAutoUpdate,
+  checkAndDownloadUpdate,
+  triggerUpdateDownload,
+  quitAndInstall,
+};
