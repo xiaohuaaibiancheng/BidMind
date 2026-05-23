@@ -6,7 +6,10 @@ const Module = require('node:module');
 const express = require('express');
 const multer = require('multer');
 
-const DATA_ROOT = path.join(process.cwd(), '.web-data');
+const DEFAULT_DATA_ROOT = process.env.VERCEL
+  ? path.join('/tmp', 'bidmind-web-data')
+  : path.join(process.cwd(), '.web-data');
+const DATA_ROOT = path.resolve(process.env.BIDMIND_DATA_ROOT || DEFAULT_DATA_ROOT);
 const USERS_ROOT = path.join(DATA_ROOT, 'users');
 const UPLOAD_ROOT = path.join(DATA_ROOT, 'uploads');
 const LEGACY_EXPORT_ROOT = path.join(DATA_ROOT, 'exports');
@@ -1424,13 +1427,9 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`[bidmind-web-api] listening on http://0.0.0.0:${PORT}`);
-});
-
-process.on('SIGINT', async () => {
+async function cleanupTempExports() {
   try {
-    const userIds = await fsp.readdir(USERS_ROOT);
+    const userIds = await fsp.readdir(USERS_ROOT).catch(() => []);
     await Promise.all(userIds.map(async (userId) => {
       const exportRoot = path.join(USERS_ROOT, userId, 'exports');
       if (!fs.existsSync(exportRoot)) {
@@ -1444,5 +1443,19 @@ process.on('SIGINT', async () => {
   } catch {
     // ignore cleanup errors
   }
-  process.exit(0);
-});
+}
+
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    console.log(`[bidmind-web-api] listening on http://0.0.0.0:${PORT}`);
+  });
+
+  process.on('SIGINT', async () => {
+    await cleanupTempExports();
+    server.close(() => {
+      process.exit(0);
+    });
+  });
+}
+
+module.exports = app;

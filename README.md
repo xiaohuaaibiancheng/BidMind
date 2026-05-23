@@ -30,6 +30,12 @@ npm run dev
 3. 用 Nginx / 网关将 `/api` 反向代理到 API 服务
 4. 将 `dist/` 部署为静态站点
 
+### Vercel 部署说明
+
+- 已提供 `vercel.json` 与 `api/[...path].cjs`，`/api/*` 会由 Vercel Function 承接。
+- 若在 Vercel 运行，服务端数据目录默认会落到 `/tmp/bidmind-web-data`（临时目录）。
+- `/tmp` 数据 **不保证持久化**，正式多用户环境建议把用户、会话、项目数据迁移到数据库/对象存储。
+
 ## 关键改造点
 
 - 新增 `src/platform/webBridge.ts`：在网页端注入 `window.bidmind`，与桌面端 API 结构保持一致。
