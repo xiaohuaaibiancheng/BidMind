@@ -4,6 +4,9 @@
   "private": true,
   "description": "BidMind网页端",
   "type": "module",
+  "engines": {
+    "node": "20.x"
+  },
   "scripts": {
     "dev": "concurrently -k -n api,vite -c magenta,blue \"npm run dev:server\" \"npm run dev:web\"",
     "dev:web": "vite --host 127.0.0.1 --port 5173 --strictPort",
