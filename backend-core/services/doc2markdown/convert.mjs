@@ -11,8 +11,6 @@ import * as cheerio from 'cheerio';
 import iconv from 'iconv-lite';
 import mammoth from 'mammoth';
 import { lookup as lookupMimeType } from 'mime-types';
-import { PDFParse } from 'pdf-parse';
-import { getDocument, OPS } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import TurndownService from 'turndown';
 import turndownPluginGfm from 'turndown-plugin-gfm';
 
@@ -32,9 +30,59 @@ const PDF_TEXT_DUPLICATE_TOLERANCE = 1;
 const PDF_TEXT_LINE_TOLERANCE = 3;
 
 const { gfm } = turndownPluginGfm;
-const PDF_OP_NAMES = Object.fromEntries(Object.entries(OPS).map(([name, value]) => [value, name]));
 const requireCjs = createRequire(import.meta.url);
 const { LIBREOFFICE_REQUIRED_MESSAGE } = requireCjs('../documentParseErrors.cjs');
+let cachedPdfParseCtor;
+let cachedPdfParseLoadError;
+let cachedPdfJsRuntime;
+let cachedPdfJsLoadError;
+
+async function loadPdfParseCtor() {
+  if (cachedPdfParseCtor) {
+    return cachedPdfParseCtor;
+  }
+  if (cachedPdfParseLoadError) {
+    return null;
+  }
+
+  try {
+    const module = await import('pdf-parse');
+    const ctor = module?.PDFParse;
+    if (typeof ctor !== 'function') {
+      throw new Error('pdf-parse 未导出可用的 PDFParse 构造器');
+    }
+    cachedPdfParseCtor = ctor;
+    return cachedPdfParseCtor;
+  } catch (error) {
+    cachedPdfParseLoadError = error;
+    return null;
+  }
+}
+
+async function loadPdfJsRuntime() {
+  if (cachedPdfJsRuntime) {
+    return cachedPdfJsRuntime;
+  }
+  if (cachedPdfJsLoadError) {
+    return null;
+  }
+
+  try {
+    const module = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    if (typeof module?.getDocument !== 'function' || !module?.OPS) {
+      throw new Error('pdfjs-dist 未导出可用的 getDocument/OPS');
+    }
+    const opNames = Object.fromEntries(Object.entries(module.OPS).map(([name, value]) => [value, name]));
+    cachedPdfJsRuntime = {
+      getDocument: module.getDocument,
+      opNames,
+    };
+    return cachedPdfJsRuntime;
+  } catch (error) {
+    cachedPdfJsLoadError = error;
+    return null;
+  }
+}
 
 export class ConversionError extends Error {
   constructor(code, message, details = {}) {
@@ -230,7 +278,13 @@ function restoreTables(markdown, placeholders) {
 
 async function convertPdfFile(inputPath, includeImages, imageResolver) {
   const buffer = await readFile(inputPath);
-  const parser = new PDFParse({ data: buffer });
+  const PDFParseCtor = await loadPdfParseCtor();
+  if (!PDFParseCtor) {
+    const message = cachedPdfParseLoadError?.message || 'pdf-parse 模块不可用';
+    throw new ConversionError('pdf_parser_unavailable', `当前运行环境暂不支持 PDF 本地解析：${message}`);
+  }
+
+  const parser = new PDFParseCtor({ data: buffer });
 
   try {
     const textResult = await parser.getText({ parseHyperlinks: true });
@@ -260,7 +314,12 @@ async function safePdfCall(callback) {
 }
 
 async function extractPdfJsTables(buffer) {
-  const loadingTask = getDocument({
+  const runtime = await loadPdfJsRuntime();
+  if (!runtime) {
+    return null;
+  }
+
+  const loadingTask = runtime.getDocument({
     data: new Uint8Array(buffer),
     disableWorker: true,
   });
@@ -275,7 +334,7 @@ async function extractPdfJsTables(buffer) {
         page.getOperatorList(),
       ]);
       const textItems = normalizePdfJsTextItems(textContent.items || []);
-      const rectangles = extractPdfJsRectangles(operatorList);
+      const rectangles = extractPdfJsRectangles(operatorList, runtime.opNames);
       pages.push({ tables: buildPdfJsTables(rectangles, textItems) });
     }
     return { pages };
@@ -321,13 +380,13 @@ function normalizePdfJsTextItems(items) {
   return kept;
 }
 
-function extractPdfJsRectangles(operatorList) {
+function extractPdfJsRectangles(operatorList, opNames = {}) {
   const rectangles = [];
   const stack = [];
   let matrix = [1, 0, 0, 1, 0, 0];
 
   for (let index = 0; index < operatorList.fnArray.length; index += 1) {
-    const name = PDF_OP_NAMES[operatorList.fnArray[index]];
+    const name = opNames[operatorList.fnArray[index]];
     const args = operatorList.argsArray[index];
 
     if (name === 'save') {

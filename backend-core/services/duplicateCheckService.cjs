@@ -6,7 +6,6 @@ const AdmZip = require('adm-zip');
 const CFB = require('cfb');
 const cheerio = require('cheerio');
 const iconv = require('iconv-lite');
-const { PDFParse } = require('pdf-parse');
 const {
   getDuplicateCheckDir,
   getGeneratedImagesDir,
@@ -16,6 +15,31 @@ const {
 } = require('../utils/paths.cjs');
 const { normalizeDocumentParseError } = require('./documentParseErrors.cjs');
 const { parseDocumentWithConfig } = require('./fileService.cjs');
+
+let cachedPdfParseCtor;
+let cachedPdfParseLoadError;
+
+function resolvePdfParseCtor() {
+  if (cachedPdfParseCtor) {
+    return cachedPdfParseCtor;
+  }
+  if (cachedPdfParseLoadError) {
+    return null;
+  }
+
+  try {
+    const loaded = require('pdf-parse');
+    const ctor = loaded?.PDFParse;
+    if (typeof ctor !== 'function') {
+      throw new Error('pdf-parse 未导出可用的 PDFParse 构造器');
+    }
+    cachedPdfParseCtor = ctor;
+    return cachedPdfParseCtor;
+  } catch (error) {
+    cachedPdfParseLoadError = error;
+    return null;
+  }
+}
 
 const metadataLabels = {
   file_name: '文件名',
@@ -820,31 +844,48 @@ function addPdfRawFields(fields, buffer) {
 
 async function extractPdfMetadata(filePath) {
   const buffer = await fs.readFile(filePath);
-  const parser = new PDFParse({ data: buffer });
   const fields = new Map();
-  try {
-    const result = await parser.getInfo();
-    const info = result.info || {};
-    const metadata = result.metadata || null;
-    addPdfInfoFields(fields, info);
-    addPdfXmpFields(fields, metadata);
-    addFieldIfAbsent(fields, 'title', getPdfMetadataValue(metadata, 'dc:title', 'Title'));
-    addFieldIfAbsent(fields, 'author', getPdfMetadataValue(metadata, 'dc:creator', 'Author'));
-    addFieldIfAbsent(fields, 'subject', getPdfMetadataValue(metadata, 'dc:subject', 'Subject'));
-    addFieldIfAbsent(fields, 'keywords', getPdfMetadataValue(metadata, 'pdf:Keywords', 'Keywords'));
-    addFieldIfAbsent(fields, 'creator', getPdfMetadataValue(metadata, 'xmp:CreatorTool', 'Creator'));
-    addFieldIfAbsent(fields, 'producer', getPdfMetadataValue(metadata, 'pdf:Producer', 'Producer'));
-    addFieldIfAbsent(fields, 'created', getPdfMetadataValue(metadata, 'xmp:CreateDate', 'CreationDate'));
-    addFieldIfAbsent(fields, 'modified', getPdfMetadataValue(metadata, 'xmp:ModifyDate', 'xmp:MetadataDate', 'ModDate'));
-    addField(fields, 'pages', result.total || result.pages || result.numpages);
-    addField(fields, 'pdf_version', result.version || info.PDFFormatVersion);
-    addField(fields, 'fingerprints', result.fingerprints);
-    addField(fields, 'pdf_permissions', result.permission);
-    addPdfRawFields(fields, buffer);
-    addWpsSignalFields(fields);
-  } finally {
-    await parser.destroy();
+  const PDFParseCtor = resolvePdfParseCtor();
+
+  if (PDFParseCtor) {
+    let parser = null;
+    try {
+      parser = new PDFParseCtor({ data: buffer });
+      const result = await parser.getInfo();
+      const info = result.info || {};
+      const metadata = result.metadata || null;
+      addPdfInfoFields(fields, info);
+      addPdfXmpFields(fields, metadata);
+      addFieldIfAbsent(fields, 'title', getPdfMetadataValue(metadata, 'dc:title', 'Title'));
+      addFieldIfAbsent(fields, 'author', getPdfMetadataValue(metadata, 'dc:creator', 'Author'));
+      addFieldIfAbsent(fields, 'subject', getPdfMetadataValue(metadata, 'dc:subject', 'Subject'));
+      addFieldIfAbsent(fields, 'keywords', getPdfMetadataValue(metadata, 'pdf:Keywords', 'Keywords'));
+      addFieldIfAbsent(fields, 'creator', getPdfMetadataValue(metadata, 'xmp:CreatorTool', 'Creator'));
+      addFieldIfAbsent(fields, 'producer', getPdfMetadataValue(metadata, 'pdf:Producer', 'Producer'));
+      addFieldIfAbsent(fields, 'created', getPdfMetadataValue(metadata, 'xmp:CreateDate', 'CreationDate'));
+      addFieldIfAbsent(fields, 'modified', getPdfMetadataValue(metadata, 'xmp:ModifyDate', 'xmp:MetadataDate', 'ModDate'));
+      addField(fields, 'pages', result.total || result.pages || result.numpages);
+      addField(fields, 'pdf_version', result.version || info.PDFFormatVersion);
+      addField(fields, 'fingerprints', result.fingerprints);
+      addField(fields, 'pdf_permissions', result.permission);
+    } catch (error) {
+      addField(fields, 'metadata_error', error?.message || 'PDF 元数据读取失败');
+    } finally {
+      if (parser?.destroy) {
+        try {
+          await parser.destroy();
+        } catch {
+          // ignore parser cleanup errors
+        }
+      }
+    }
+  } else {
+    const loadMessage = cachedPdfParseLoadError?.message || 'pdf-parse 不可用';
+    addField(fields, 'metadata_error', `PDF 元数据解析能力不可用：${loadMessage}`);
   }
+
+  addPdfRawFields(fields, buffer);
+  addWpsSignalFields(fields);
   return fields;
 }
 
