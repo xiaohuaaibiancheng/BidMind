@@ -4,8 +4,7 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/[...path].cjs": {
-      "runtime": "nodejs20.x",
+    "api/**/*.cjs": {
       "maxDuration": 300
     }
   }
