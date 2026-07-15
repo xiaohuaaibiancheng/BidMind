@@ -39,11 +39,22 @@ function hasRunningTask(state: TechnicalPlanState) {
     || state.contentGenerationTask?.status === 'running';
 }
 
+function buildStatePartial(prev: TechnicalPlanState, next: TechnicalPlanState): Partial<TechnicalPlanState> {
+  const partial: Partial<TechnicalPlanState> = {};
+  (Object.keys(next) as Array<keyof TechnicalPlanState>).forEach((key) => {
+    if (!Object.is(prev[key], next[key])) {
+      (partial as Record<string, unknown>)[String(key)] = next[key] as unknown;
+    }
+  });
+  return partial;
+}
+
 export function useTechnicalPlanWorkflow() {
   const [state, setState] = useState<TechnicalPlanState>(initialState);
   const [cacheReady, setCacheReady] = useState(false);
   const latestStateRef = useRef(state);
   const cacheReadyRef = useRef(false);
+  const persistedStateRef = useRef<TechnicalPlanState>(initialState);
 
   useEffect(() => {
     latestStateRef.current = state;
@@ -57,8 +68,16 @@ export function useTechnicalPlanWorkflow() {
     let mounted = true;
 
     const loadCache = async () => {
+      const localSummary = technicalPlanStorage.loadCachedSummary();
+      if (mounted && localSummary) {
+        setState((prev) => ({ ...prev, ...localSummary }));
+      }
+
+      const summaryPromise = technicalPlanStorage.loadSummary();
+      const statePromise = technicalPlanStorage.load();
+
       try {
-        const cachedSummary = await technicalPlanStorage.loadSummary();
+        const cachedSummary = await summaryPromise;
         if (mounted && cachedSummary) {
           setState((prev) => ({ ...prev, ...cachedSummary }));
         }
@@ -67,9 +86,10 @@ export function useTechnicalPlanWorkflow() {
       }
 
       try {
-        const cachedState = await technicalPlanStorage.load();
+        const cachedState = await statePromise;
         if (mounted && cachedState) {
           setState({ ...initialState, ...cachedState });
+          persistedStateRef.current = { ...initialState, ...cachedState };
         }
       } catch (error) {
         console.warn('技术方案缓存读取失败', error);
@@ -96,8 +116,13 @@ export function useTechnicalPlanWorkflow() {
       if (hasRunningTask(state)) {
         return;
       }
-
-      technicalPlanStorage.save(state).catch((error) => {
+      const partial = buildStatePartial(persistedStateRef.current, state);
+      if (!Object.keys(partial).length) {
+        return;
+      }
+      technicalPlanStorage.savePartial(partial).then(() => {
+        persistedStateRef.current = state;
+      }).catch((error) => {
         console.warn('技术方案缓存保存失败', error);
       });
     }, 300);
@@ -115,8 +140,13 @@ export function useTechnicalPlanWorkflow() {
     if (hasRunningTask(latestStateRef.current)) {
       return;
     }
-
-    technicalPlanStorage.save(latestStateRef.current).catch((error) => {
+    const partial = buildStatePartial(persistedStateRef.current, latestStateRef.current);
+    if (!Object.keys(partial).length) {
+      return;
+    }
+    technicalPlanStorage.savePartial(partial).then(() => {
+      persistedStateRef.current = latestStateRef.current;
+    }).catch((error) => {
       console.warn('技术方案缓存保存失败', error);
     });
   }, []);

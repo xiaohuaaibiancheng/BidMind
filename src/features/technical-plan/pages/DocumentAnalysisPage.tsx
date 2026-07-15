@@ -1,9 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
-import { isLibreOfficeRequiredMessage, MarkdownRenderer, useDocumentParseNotice, useToast } from '../../../shared/ui';
-import type { FileParserProvider } from '../../../shared/types';
+import { useEffect, useState, type DragEvent } from 'react';
+import { isLibreOfficeRequiredMessage, useDocumentParseNotice, useToast } from '../../../shared/ui';
+import type { FileImportResult, FileParserProvider } from '../../../shared/types';
 
-const LARGE_MARKDOWN_THRESHOLD = 120_000;
-const FAST_PREVIEW_LINE_BATCH = 260;
 const parseHints = [
   '正在读取文件内容',
   '正在解析正文结构',
@@ -19,41 +17,33 @@ const parserLabels: Record<FileParserProvider, string> = {
 interface DocumentAnalysisPageProps {
   fileName: string;
   fileContent: string;
+  onBusyChange?: (busy: boolean) => void;
   onFileImported: (fileName: string, fileContent: string) => void;
 }
 
 function DocumentAnalysisPage({
   fileName,
   fileContent,
+  onBusyChange,
   onFileImported,
 }: DocumentAnalysisPageProps) {
   const [parserLabel, setParserLabel] = useState(parserLabels.local);
   const [busy, setBusy] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const [busyHintIndex, setBusyHintIndex] = useState(0);
   const [busyStartedAt, setBusyStartedAt] = useState<number | null>(null);
   const [busyTick, setBusyTick] = useState(() => Date.now());
-  const [previewMode, setPreviewMode] = useState<'fast' | 'markdown'>('markdown');
-  const [fastPreviewLineCount, setFastPreviewLineCount] = useState(FAST_PREVIEW_LINE_BATCH);
   const { showToast } = useToast();
   const { showDocumentParseNotice } = useDocumentParseNotice();
-  const isLargeDocument = fileContent.length > LARGE_MARKDOWN_THRESHOLD;
-  const fileLines = useMemo(() => (fileContent ? fileContent.split(/\r?\n/) : []), [fileContent]);
-  const fastPreviewHasMore = fileLines.length > fastPreviewLineCount;
-  const fastPreviewText = useMemo(
-    () => (fastPreviewHasMore ? fileLines.slice(0, fastPreviewLineCount).join('\n') : fileContent),
-    [fastPreviewHasMore, fastPreviewLineCount, fileContent, fileLines]
-  );
   const busyElapsedSeconds = busyStartedAt ? Math.max(1, Math.floor((busyTick - busyStartedAt) / 1000)) : 0;
 
   useEffect(() => {
-    if (!fileContent) {
-      setPreviewMode('markdown');
-      setFastPreviewLineCount(FAST_PREVIEW_LINE_BATCH);
-      return;
-    }
-    setPreviewMode(isLargeDocument ? 'fast' : 'markdown');
-    setFastPreviewLineCount(FAST_PREVIEW_LINE_BATCH);
-  }, [fileContent, isLargeDocument]);
+    onBusyChange?.(busy);
+  }, [busy, onBusyChange]);
+
+  useEffect(() => () => {
+    onBusyChange?.(false);
+  }, [onBusyChange]);
 
   useEffect(() => {
     let mounted = true;
@@ -103,26 +93,35 @@ function DocumentAnalysisPage({
     };
   }, [busy]);
 
-  const importDocument = async () => {
-    try {
-      setBusy(true);
-      const result = await window.bidmind?.file.importDocument();
-
-      if (!result?.success || !result.file_content) {
-        const message = result?.message || '未导入文件';
-        if (isLibreOfficeRequiredMessage(message)) {
-          showDocumentParseNotice(message);
-          return;
-        }
-        showToast(message, message === '已取消选择' ? 'info' : 'error');
+  const handleImportResult = (result: FileImportResult | undefined) => {
+    if (!result?.success || !result.file_content) {
+      const message = result?.message || '未导入文件';
+      if (isLibreOfficeRequiredMessage(message)) {
+        showDocumentParseNotice(message);
         return;
       }
+      showToast(message, message === '已取消选择' ? 'info' : 'error');
+      return;
+    }
 
-      onFileImported(result.file_name || '未命名文件', result.file_content);
-      if (result.parser_label) {
-        setParserLabel(result.parser_label);
+    onFileImported(result.file_name || '未命名文件', result.file_content);
+    if (result.parser_label) {
+      setParserLabel(result.parser_label);
+    }
+    showToast(result.message, 'success');
+  };
+
+  const importDocument = async (file?: File) => {
+    try {
+      setBusy(true);
+      if (file && !window.bidmind?.file.importDocumentFile) {
+        showToast('当前环境不支持拖拽直传，请点击上传区选择文件', 'info');
+        return;
       }
-      showToast(result.message, 'success');
+      const result = file
+        ? await window.bidmind?.file.importDocumentFile?.(file)
+        : await window.bidmind?.file.importDocument();
+      handleImportResult(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : '文件解析失败';
       if (isLibreOfficeRequiredMessage(message)) {
@@ -135,16 +134,90 @@ function DocumentAnalysisPage({
     }
   };
 
+  const handleUploadDragOver = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    if (!busy) {
+      setDragActive(true);
+    }
+  };
+
+  const handleUploadDragLeave = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setDragActive(false);
+    }
+  };
+
+  const handleUploadDrop = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    setDragActive(false);
+    if (busy) return;
+
+    const file = event.dataTransfer.files?.[0];
+    if (!file) {
+      showToast('没有读取到文件，请重新拖入', 'error');
+      return;
+    }
+    void importDocument(file);
+  };
+
   return (
     <div className="plan-step-body document-analysis-page">
-      <section className="analysis-import-card">
-        <div>
+      <section className="analysis-import-card analysis-upload-panel">
+        <div className="analysis-upload-info">
           <span className="section-kicker">STEP 01</span>
           <strong>上传招标文件</strong>
-          <p>当前解析方案：{parserLabel}</p>
+          <span className="analysis-upload-rule-line" aria-hidden="true" />
+          <p>支持 Word、PDF、TXT、MD 格式文件</p>
+          <p>单次支持上传一份文件，文件大小不超过 50 MB</p>
+
+          <div className="analysis-upload-file-icons" aria-hidden="true">
+            <span className="analysis-file-icon is-word">W</span>
+            <span className="analysis-file-icon is-pdf">P</span>
+            <span className="analysis-file-icon is-text">T</span>
+            <span className="analysis-file-icon is-md">M</span>
+          </div>
         </div>
+
+        <button
+          type="button"
+          className={`analysis-upload-dropzone${dragActive ? ' is-drag-active' : ''}`}
+          onClick={() => void importDocument()}
+          onDragOver={handleUploadDragOver}
+          onDragLeave={handleUploadDragLeave}
+          onDrop={handleUploadDrop}
+          disabled={busy}
+          aria-label="上传招标文件"
+        >
+          <span className="analysis-upload-folder" aria-hidden="true">
+            <span />
+          </span>
+          <span className="analysis-upload-title">
+            {busy ? parseHints[busyHintIndex] : (
+              <>
+                <strong>拖动文件到此上传</strong>
+                <em>或点击 上传文件</em>
+              </>
+            )}
+          </span>
+          <span className="analysis-upload-button">
+            {busy ? (
+              <>
+                <span className="button-spinner" aria-hidden="true" />
+                解析中...
+              </>
+            ) : fileContent ? '重新上传招标文件' : '上传招标文件'}
+          </span>
+          <small>
+            {busy ? `已处理 ${busyElapsedSeconds} 秒，请稍候...` : `当前解析方案：${parserLabel}`}
+          </small>
+          <span className={`analysis-upload-file-name${fileName ? ' has-file' : ''}`}>
+            {fileName ? `当前文件：${fileName}` : '尚未上传招标文件'}
+          </span>
+        </button>
+
         {busy && (
-          <div className="analysis-import-status" role="status" aria-live="polite">
+          <div className="analysis-import-status analysis-upload-status" role="status" aria-live="polite">
             <span className="inline-spinner" aria-hidden="true" />
             <div>
               <strong>{parseHints[busyHintIndex]}</strong>
@@ -152,94 +225,7 @@ function DocumentAnalysisPage({
             </div>
           </div>
         )}
-        <div className="analysis-actions">
-          <button type="button" className="primary-action" onClick={importDocument} disabled={busy}>
-            {busy ? (
-              <>
-                <span className="button-spinner" aria-hidden="true" />
-                解析中...
-              </>
-            ) : fileContent ? '重新选择文件' : '选择文件'}
-          </button>
-        </div>
       </section>
-
-      <section className="analysis-markdown-card">
-        <div className="analysis-result-head">
-          <div>
-            <strong>招标文件内容</strong>
-            {isLargeDocument && (
-              <small>文档较大，默认快速预览以提升历史加载速度</small>
-            )}
-          </div>
-          <span>{fileContent ? '来自原始招标文件' : '等待上传'}</span>
-        </div>
-
-        {fileContent ? (
-          <div className="analysis-markdown-preview">
-            {isLargeDocument && (
-              <div className="analysis-preview-mode-switch" role="tablist" aria-label="预览模式">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={previewMode === 'fast'}
-                  className={previewMode === 'fast' ? 'is-active' : ''}
-                  onClick={() => setPreviewMode('fast')}
-                >
-                  快速预览
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={previewMode === 'markdown'}
-                  className={previewMode === 'markdown' ? 'is-active' : ''}
-                  onClick={() => setPreviewMode('markdown')}
-                >
-                  Markdown 渲染
-                </button>
-              </div>
-            )}
-            {previewMode === 'markdown' ? (
-              <div className="markdown-viewer">
-                <MarkdownRenderer allowRawHtml={false}>
-                  {fileContent}
-                </MarkdownRenderer>
-              </div>
-            ) : (
-              <div className="analysis-fast-preview-wrap">
-                <pre className="analysis-fast-preview" aria-label="快速预览文本">
-                  {fastPreviewText}
-                </pre>
-                {fastPreviewHasMore && (
-                  <button
-                    type="button"
-                    className="analysis-fast-preview-more"
-                    onClick={() => setFastPreviewLineCount((prev) => prev + FAST_PREVIEW_LINE_BATCH)}
-                  >
-                    加载更多内容（已显示 {Math.min(fastPreviewLineCount, fileLines.length)} / {fileLines.length} 行）
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="markdown-empty-state">
-            <strong>尚未导入招标文件</strong>
-            <p>当前步骤只负责把招标文件解析成 Markdown。下一步再基于这里的 Markdown 内容进行 AI 标书理解。</p>
-          </div>
-        )}
-
-        {busy && (
-          <div className="analysis-parsing-overlay" role="status" aria-live="polite">
-            <div className="analysis-parsing-overlay-card">
-              <span className="inline-spinner" aria-hidden="true" />
-              <strong>{parseHints[busyHintIndex]}</strong>
-              <small>{fileName ? `正在更新：${fileName}` : '正在处理你刚选择的文件'}</small>
-            </div>
-          </div>
-        )}
-      </section>
-
     </div>
   );
 }

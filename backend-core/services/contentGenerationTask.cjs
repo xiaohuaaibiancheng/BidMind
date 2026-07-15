@@ -5,6 +5,8 @@ const MERMAID_REPAIR_ATTEMPTS = 3;
 const MERMAID_RENDER_TIMEOUT_MS = 15000;
 const AI_IMAGE_CONCURRENCY = 2;
 const MERMAID_IMAGE_CONCURRENCY = 5;
+const CONTENT_STREAM_RENDER_INTERVAL_MS = 320;
+const CONTENT_STREAM_RENDER_MIN_CHARS = 220;
 const TABLE_REQUIREMENT_LABELS = {
   none: '不要',
   light: '少量',
@@ -1065,16 +1067,20 @@ async function runContentGenerationTask({ aiService, workspaceStore, knowledgeBa
   function saveSection(item, partial, contentForOutline, taskPartial = {}) {
     const prev = workspaceStore.loadTechnicalPlan() || {};
     sections = withSection(prev.contentGenerationSections || sections, item, partial);
-    const currentOutlineData = prev.outlineData || outlineData;
-    const outlineContent = contentForOutline ?? (sections[item.id].content || '');
-    const nextOutlineData = {
-      ...currentOutlineData,
-      outline: updateOutlineItemContent(currentOutlineData.outline || outlineData.outline, item.id, outlineContent),
-    };
-    const saved = workspaceStore.updateTechnicalPlan({
+    const shouldUpdateOutlineData = partial?.status !== 'running';
+    const updatePartial = {
       contentGenerationSections: sections,
-      outlineData: nextOutlineData,
-    });
+    };
+    if (shouldUpdateOutlineData) {
+      const currentOutlineData = prev.outlineData || outlineData;
+      const outlineContent = contentForOutline ?? (sections[item.id].content || '');
+      const nextOutlineData = {
+        ...currentOutlineData,
+        outline: updateOutlineItemContent(currentOutlineData.outline || outlineData.outline, item.id, outlineContent),
+      };
+      updatePartial.outlineData = nextOutlineData;
+    }
+    const saved = workspaceStore.updateTechnicalPlan(updatePartial);
     updateTask({ status: 'running', progress: progressFor(leaves, sections), stats: statsSnapshot(), ...taskPartial }, saved);
     return saved;
   }
@@ -1248,12 +1254,29 @@ async function runContentGenerationTask({ aiService, workspaceStore, knowledgeBa
     const isSingleSectionRegeneration = Boolean(targetItemId);
     let rawContent = regenerate ? '' : previousContent;
     let content = stripRepeatedChapterTitle(normalizeGeneratedMarkdown(rawContent), item);
+    let lastRenderAt = Date.now();
+    let lastRenderLength = content.length;
     logs = [...logs, `开始生成：${item.id} ${item.title || '未命名章节'}`];
     saveSection(item, {
       status: 'running',
       content: isSingleSectionRegeneration ? previousContent : content,
       error: undefined,
     }, isSingleSectionRegeneration ? previousContent : content, { logs });
+
+    const flushRealtimeRender = (force = false) => {
+      if (!realTimeRender || isSingleSectionRegeneration) {
+        return;
+      }
+      const now = Date.now();
+      const lengthDelta = content.length - lastRenderLength;
+      const elapsed = now - lastRenderAt;
+      if (!force && lengthDelta < CONTENT_STREAM_RENDER_MIN_CHARS && elapsed < CONTENT_STREAM_RENDER_INTERVAL_MS) {
+        return;
+      }
+      saveSection(item, { status: 'running', content, error: undefined }, content);
+      lastRenderAt = now;
+      lastRenderLength = content.length;
+    };
 
     try {
       const contentPlan = contentPlans.get(item.id) || normalizeContentPlan({});
@@ -1268,9 +1291,7 @@ async function runContentGenerationTask({ aiService, workspaceStore, knowledgeBa
         }
         rawContent += event.chunk;
         content = stripRepeatedChapterTitle(normalizeGeneratedMarkdown(rawContent), item);
-        if (realTimeRender && !isSingleSectionRegeneration) {
-          saveSection(item, { status: 'running', content, error: undefined }, content);
-        }
+        flushRealtimeRender();
       });
 
       content = stripRepeatedChapterTitle(normalizeGeneratedMarkdown(rawContent), item);

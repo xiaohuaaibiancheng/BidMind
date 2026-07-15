@@ -5,6 +5,8 @@ const stableSystemPrompt = `你是专业的招标文件分析助手。请严格�
 2. 如果原文没有提及，明确写“没有提及”或“原文未提及”。
 3. 只输出最终结果，不输出过程、提示语或客套话。
 4. 始终使用简体中文。`;
+const BID_ANALYSIS_STREAM_RENDER_INTERVAL_MS = 280;
+const BID_ANALYSIS_STREAM_RENDER_MIN_CHARS = 180;
 
 function jsonTask(title, goals, outputJson) {
   return `任务：${title}
@@ -90,20 +92,34 @@ async function runBidAnalysisTask({ aiService, workspaceStore, updateTask, paylo
 
   async function runOne(task) {
     let content = '';
+    let lastRenderAt = Date.now();
+    let lastRenderLength = 0;
     workspaceStore.updateTechnicalPlan({
       bidAnalysisTasks: { ...(workspaceStore.loadTechnicalPlan()?.bidAnalysisTasks || {}), [task.id]: { id: task.id, label: task.label, status: 'running', content: '' } },
     });
 
+    const flushRealtimeRender = (force = false) => {
+      if (!realTimeRender) {
+        return;
+      }
+      const now = Date.now();
+      const lengthDelta = content.length - lastRenderLength;
+      const elapsed = now - lastRenderAt;
+      if (!force && lengthDelta < BID_ANALYSIS_STREAM_RENDER_MIN_CHARS && elapsed < BID_ANALYSIS_STREAM_RENDER_INTERVAL_MS) {
+        return;
+      }
+      const prev = workspaceStore.loadTechnicalPlan() || {};
+      const nextTasks = { ...(prev.bidAnalysisTasks || {}), [task.id]: { id: task.id, label: task.label, status: 'running', content } };
+      technicalPlan = workspaceStore.updateTechnicalPlan({ bidAnalysisTasks: nextTasks, bidAnalysisProgress: doneProgress(nextTasks) });
+      updateTask({ status: 'running', progress: technicalPlan.bidAnalysisProgress || 0 }, technicalPlan);
+      lastRenderAt = now;
+      lastRenderLength = content.length;
+    };
+
     await aiService.streamChat({ messages: buildMessages(payload.fileContent, task), temperature: 0.1, response_format: task.output === 'json' ? { type: 'json_object' } : undefined }, (event) => {
       if (event.type === 'chunk' && event.chunk) {
         content += event.chunk;
-        if (!realTimeRender) {
-          return;
-        }
-        const prev = workspaceStore.loadTechnicalPlan() || {};
-        const nextTasks = { ...(prev.bidAnalysisTasks || {}), [task.id]: { id: task.id, label: task.label, status: 'running', content } };
-        technicalPlan = workspaceStore.updateTechnicalPlan({ bidAnalysisTasks: nextTasks, bidAnalysisProgress: doneProgress(nextTasks) });
-        updateTask({ status: 'running', progress: technicalPlan.bidAnalysisProgress || 0 }, technicalPlan);
+        flushRealtimeRender();
       }
     });
 

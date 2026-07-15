@@ -4,7 +4,15 @@ import { useToast } from '../../../shared/ui';
 import type { ManagedProject, ProjectStatus, ProjectWorkbenchType, ProjectWorkspaceState } from '../types';
 
 const PROJECT_SUMMARY_COLLAPSED_KEY = 'bidmind:project-management:summary-collapsed:v1';
+const PROJECT_CREATE_COLLAPSED_KEY = 'bidmind:project-management:create-collapsed:v1';
 const PROJECT_LIST_PAGE_SIZE = 24;
+const PROJECT_DATE_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
+  hour12: false,
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+});
 
 const statusMeta: Record<ProjectStatus, { label: string; desc: string; empty: string }> = {
   'in-progress': {
@@ -65,13 +73,7 @@ function formatDateText(value: string) {
   if (Number.isNaN(date.getTime())) {
     return '未知时间';
   }
-  return date.toLocaleString('zh-CN', {
-    hour12: false,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  return PROJECT_DATE_FORMATTER.format(date);
 }
 
 function createProject(name: string, code: string, workbench: ProjectWorkbenchType): ManagedProject {
@@ -88,9 +90,9 @@ function createProject(name: string, code: string, workbench: ProjectWorkbenchTy
   };
 }
 
-function loadSummaryCollapsedPreference() {
+function loadCollapsedPreference(key: string) {
   try {
-    return localStorage.getItem(PROJECT_SUMMARY_COLLAPSED_KEY) === '1';
+    return localStorage.getItem(key) === '1';
   } catch {
     return false;
   }
@@ -99,12 +101,14 @@ function loadSummaryCollapsedPreference() {
 function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManagementPageProps) {
   const { showToast } = useToast();
   const hydratedRef = useRef(false);
+  const workspaceRef = useRef<ProjectWorkspaceState>({ projects: [] });
   const lastSyncedProjectIdRef = useRef('');
   const projectListRef = useRef<HTMLDivElement | null>(null);
   const projectListLoadMoreRef = useRef<HTMLDivElement | null>(null);
   const [workspace, setWorkspace] = useState<ProjectWorkspaceState>({ projects: [] });
   const [activeStatus, setActiveStatus] = useState<ProjectStatus>('in-progress');
-  const [summaryCollapsed, setSummaryCollapsed] = useState(loadSummaryCollapsedPreference);
+  const [summaryCollapsed, setSummaryCollapsed] = useState(() => loadCollapsedPreference(PROJECT_SUMMARY_COLLAPSED_KEY));
+  const [createCollapsed, setCreateCollapsed] = useState(() => loadCollapsedPreference(PROJECT_CREATE_COLLAPSED_KEY));
   const [projectName, setProjectName] = useState('');
   const [projectCode, setProjectCode] = useState('');
   const [projectWorkbench, setProjectWorkbench] = useState<ProjectWorkbenchType>('technical-plan');
@@ -133,7 +137,12 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
     };
   }, [showToast]);
 
+  useEffect(() => {
+    workspaceRef.current = workspace;
+  }, [workspace]);
+
   const persistWorkspace = async (nextWorkspace: ProjectWorkspaceState, fallbackMessage = '保存项目数据失败') => {
+    const previousWorkspace = workspaceRef.current;
     setWorkspace(nextWorkspace);
     if (!hydratedRef.current) {
       return false;
@@ -142,6 +151,7 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
       await window.bidmind?.workspace.saveProjects(nextWorkspace);
       return true;
     } catch (error) {
+      setWorkspace(previousWorkspace);
       showToast(error instanceof Error ? error.message : fallbackMessage, 'error');
       return false;
     }
@@ -154,6 +164,14 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
       // 忽略本地存储不可用场景，保持页面功能可用
     }
   }, [summaryCollapsed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PROJECT_CREATE_COLLAPSED_KEY, createCollapsed ? '1' : '0');
+    } catch {
+      // 忽略本地存储不可用场景，保持页面功能可用
+    }
+  }, [createCollapsed]);
 
   useEffect(() => {
     if (!activeProjectId) return;
@@ -232,7 +250,6 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
   };
 
   const removeProject = async (projectId: string) => {
-    const currentActiveProjectId = workspaceStorage.load()?.activeProjectId || '';
     const nextWorkspace: ProjectWorkspaceState = {
       projects: workspace.projects.filter((item) => item.id !== projectId),
     };
@@ -241,7 +258,7 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
       return;
     }
 
-    if (currentActiveProjectId && currentActiveProjectId === projectId) {
+    if (activeProjectId && activeProjectId === projectId) {
       workspaceStorage.save({ activeProjectId: '' });
     }
 
@@ -322,52 +339,63 @@ function ProjectManagementPage({ activeProjectId, onOpenProject }: ProjectManage
         )}
       </section>
 
-      <section className="project-create-panel">
-        <div className="project-create-card">
-          <h3>创建新项目</h3>
-          <label className="project-create-name-field">
-            项目名称
-            <input
-              type="text"
-              value={projectName}
-              onChange={(event) => setProjectName(event.target.value)}
-              placeholder="例如：某某项目技术标"
-            />
-          </label>
-          <label className="project-create-code-field">
-            项目编号（可选）
-            <input
-              type="text"
-              value={projectCode}
-              onChange={(event) => setProjectCode(event.target.value)}
-              placeholder="例如：YM-2026-008"
-            />
-          </label>
-          <div className="project-workbench-selector" role="radiogroup" aria-label="项目类型">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={projectWorkbench === 'technical-plan'}
-              className={`workbench-chip ${projectWorkbench === 'technical-plan' ? 'is-active' : ''}`}
-              onClick={() => setProjectWorkbench('technical-plan')}
-            >
-              技术方案
-            </button>
-            <button
-              type="button"
-              role="radio"
-              aria-checked={projectWorkbench === 'business-bid'}
-              className={`workbench-chip ${projectWorkbench === 'business-bid' ? 'is-active' : ''}`}
-              onClick={() => setProjectWorkbench('business-bid')}
-            >
-              商务标
-            </button>
+      <section className={`project-create-panel${createCollapsed ? ' is-collapsed' : ''}`}>
+        <button
+          type="button"
+          className="project-create-panel-toggle"
+          onClick={() => setCreateCollapsed((prev) => !prev)}
+          aria-expanded={!createCollapsed}
+        >
+          <span className="section-kicker">快捷创建</span>
+          <strong>创建新项目</strong>
+          <em>{createCollapsed ? '展开' : '折叠'}</em>
+        </button>
+        {!createCollapsed && (
+          <div className="project-create-card">
+            <label className="project-create-name-field">
+              项目名称
+              <input
+                type="text"
+                value={projectName}
+                onChange={(event) => setProjectName(event.target.value)}
+                placeholder="例如：某某项目技术标"
+              />
+            </label>
+            <label className="project-create-code-field">
+              项目编号（可选）
+              <input
+                type="text"
+                value={projectCode}
+                onChange={(event) => setProjectCode(event.target.value)}
+                placeholder="例如：YM-2026-008"
+              />
+            </label>
+            <div className="project-workbench-selector" role="radiogroup" aria-label="项目类型">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={projectWorkbench === 'technical-plan'}
+                className={`workbench-chip ${projectWorkbench === 'technical-plan' ? 'is-active' : ''}`}
+                onClick={() => setProjectWorkbench('technical-plan')}
+              >
+                技术方案
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={projectWorkbench === 'business-bid'}
+                className={`workbench-chip ${projectWorkbench === 'business-bid' ? 'is-active' : ''}`}
+                onClick={() => setProjectWorkbench('business-bid')}
+              >
+                商务标
+              </button>
+            </div>
+            <div className="project-create-actions">
+              <button type="button" className="secondary-action" onClick={() => void handleCreateProject(projectWorkbench)}>仅创建</button>
+              <button type="button" className="primary-action" onClick={() => void handleCreateProject(projectWorkbench, true)}>创建并进入</button>
+            </div>
           </div>
-          <div className="project-create-actions">
-            <button type="button" className="secondary-action" onClick={() => void handleCreateProject(projectWorkbench)}>仅创建</button>
-            <button type="button" className="primary-action" onClick={() => void handleCreateProject(projectWorkbench, true)}>创建并进入</button>
-          </div>
-        </div>
+        )}
       </section>
 
       <section className="project-management-board">

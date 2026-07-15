@@ -137,6 +137,7 @@ function OutlineEditPage({
   const [loadingKnowledge, setLoadingKnowledge] = useState(false);
   const [localStartAt, setLocalStartAt] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  const [focusExpanded, setFocusExpanded] = useState(false);
   const logListRef = useRef<HTMLDivElement | null>(null);
   const { showToast } = useToast();
   const selectedItem = outlineData && selectedItemId ? findOutlineItem(outlineData.outline, selectedItemId) : null;
@@ -154,7 +155,6 @@ function OutlineEditPage({
         ? 100
         : 0;
   const statusText = generating ? '运行中' : taskFailed ? '失败' : outlineData ? '已完成' : '未开始';
-  const aiStatusTitle = generating ? 'AI 正在工作' : taskFailed ? '生成失败' : outlineData ? '目录已生成' : '等待生成';
   const statusMessage = taskFailed ? task?.error || latestLog || '目录生成失败，请查看开发者日志。' : latestLog || '点击生成目录后，这里会显示目录生成、审核和修正过程。';
   const startedAt = task?.started_at ? Date.parse(task.started_at) : NaN;
   const updatedAt = task?.updated_at ? Date.parse(task.updated_at) : NaN;
@@ -185,6 +185,12 @@ function OutlineEditPage({
       }
     }
   }, [task?.status]);
+
+  useEffect(() => {
+    if (generating) {
+      setFocusExpanded(true);
+    }
+  }, [generating]);
 
   useEffect(() => {
     if (!generating) {
@@ -564,21 +570,12 @@ function OutlineEditPage({
   };
 
   return (
-    <div className="plan-step-body outline-generation-page">
+    <div className={`plan-step-body outline-generation-page${focusExpanded ? ' is-focus-mode' : ''}`}>
       <section className="outline-command-bar">
         <div>
           <span className="section-kicker">STEP 03</span>
           <strong>目录生成</strong>
           <p>生成前选择目录方式和参考知识库；当前参考知识库：{referenceKnowledgeDocumentIds.length ? `已选择 ${referenceKnowledgeDocumentIds.length} 个文档` : '未选择'}。</p>
-          {generating && (
-            <div className="step-running-indicator" role="status" aria-live="polite">
-              <span className="inline-spinner" aria-hidden="true" />
-              <div>
-                <strong>{aiStatusTitle}</strong>
-                <small>{elapsedText || '任务已启动，正在整理目录结构'}</small>
-              </div>
-            </div>
-          )}
         </div>
         <div className="outline-command-actions">
           <button
@@ -605,11 +602,16 @@ function OutlineEditPage({
         </div>
       </section>
 
-      <section className="outline-generation-workspace">
+      <section className={`outline-generation-workspace${focusExpanded ? ' is-focus-mode' : ''}`}>
         <aside className="outline-progress-panel">
           <div className="analysis-result-head">
             <strong>生成过程</strong>
-            <span>{statusText}</span>
+            <div className="task-pane-head-actions">
+              <span>{statusText}</span>
+              <button type="button" onClick={() => setFocusExpanded((prev) => !prev)}>
+                {focusExpanded ? '恢复原样' : '全屏显示'}
+              </button>
+            </div>
           </div>
           <div className={`content-outline-stats outline-progress-summary${progressCollapsed ? ' is-collapsed' : ''}`}>
             <button type="button" onClick={() => setProgressCollapsed((prev) => !prev)} aria-expanded={!progressCollapsed}>
@@ -719,15 +721,6 @@ function OutlineEditPage({
             </div>
           )}
         </aside>
-        {generating && (
-          <div className="step-running-overlay" role="status" aria-live="polite">
-            <div className="step-running-overlay-card">
-              <span className="inline-spinner" aria-hidden="true" />
-              <strong>{statusMessage || '目录生成任务正在运行'}</strong>
-              <small>{elapsedText || '请稍候，目录会自动更新到中间区域。'}</small>
-            </div>
-          </div>
-        )}
       </section>
 
       <Dialog.Root open={generationDialogOpen} onOpenChange={setGenerationDialogOpen}>

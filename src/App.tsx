@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import AppRouter from './app/AppRouter';
 import UpdateNotifier from './app/UpdateNotifier';
 import AppShell from './components/AppShell';
@@ -25,15 +25,18 @@ function isSectionId(value: string | undefined): value is SectionId {
 }
 
 function App() {
+  const [workspaceSeed] = useState(() => workspaceStorage.load() || {});
   const [activeSection, setActiveSection] = useState<SectionId>(() => {
-    const saved = workspaceStorage.load()?.activeSection;
+    const saved = String(workspaceSeed.activeSection || '');
     return isSectionId(saved) ? saved : defaultSection;
   });
-  const [activeProjectId, setActiveProjectId] = useState(() => workspaceStorage.load()?.activeProjectId || '');
+  const [activeProjectId, setActiveProjectId] = useState(() => String(workspaceSeed.activeProjectId || ''));
   const [developerMode, setDeveloperMode] = useState(false);
   const [userToken, setUserToken] = useState(() => localStorage.getItem(USER_TOKEN_KEY) || '');
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [authHydrated, setAuthHydrated] = useState(false);
+  const activeSectionRef = useRef<SectionId>(activeSection);
+  const activeProjectIdRef = useRef(activeProjectId);
 
   useEffect(() => {
     trackAppOpen();
@@ -89,30 +92,44 @@ function App() {
   }, [activeSection]);
 
   useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    activeSectionRef.current = activeSection;
+  }, [activeSection]);
+
+  useEffect(() => {
     return workspaceStorage.subscribe((state) => {
       const nextProjectId = String(state.activeProjectId || '');
-      if (nextProjectId !== activeProjectId) {
+      if (nextProjectId !== activeProjectIdRef.current) {
+        activeProjectIdRef.current = nextProjectId;
         setActiveProjectId(nextProjectId);
       }
-      if (isSectionId(state.activeSection) && state.activeSection !== activeSection) {
+      if (isSectionId(state.activeSection) && state.activeSection !== activeSectionRef.current) {
+        activeSectionRef.current = state.activeSection;
         setActiveSection(state.activeSection);
       }
     });
-  }, [activeProjectId, activeSection]);
+  }, []);
 
   useEffect(() => {
     if (!developerMode && activeSection === 'developer-test') {
+      activeSectionRef.current = defaultSection;
       setActiveSection(defaultSection);
       workspaceStorage.save({ activeSection: defaultSection });
     }
   }, [activeSection, developerMode]);
 
   const handleSectionChange = (section: SectionId) => {
+    activeSectionRef.current = section;
     setActiveSection(section);
     workspaceStorage.save({ activeSection: section });
   };
 
   const handleOpenProject = (projectId: string, section: 'technical-plan' | 'business-bid') => {
+    activeProjectIdRef.current = projectId;
+    activeSectionRef.current = section;
     setActiveProjectId(projectId);
     setActiveSection(section);
     workspaceStorage.save({
@@ -126,6 +143,7 @@ function App() {
     setUserToken(token);
     setCurrentUser(user);
     if (activeSection === 'settings' || activeSection === 'developer-test') {
+      activeSectionRef.current = defaultSection;
       setActiveSection(defaultSection);
       workspaceStorage.save({ activeSection: defaultSection });
     }
@@ -135,6 +153,8 @@ function App() {
     localStorage.removeItem(USER_TOKEN_KEY);
     setUserToken('');
     setCurrentUser(null);
+    activeProjectIdRef.current = '';
+    activeSectionRef.current = defaultSection;
     setActiveSection(defaultSection);
     workspaceStorage.save({ activeSection: defaultSection });
   };

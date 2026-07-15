@@ -25,7 +25,7 @@ const API_BASE = String(import.meta.env.VITE_API_BASE || '').replace(/\/$/, '');
 const USER_TOKEN_KEY = 'bidmind:web:user-token';
 const EVENT_POLL_INTERVAL = 1000;
 const EVENT_POLL_INTERVAL_BY_CHANNEL: Record<'tasks' | 'knowledge' | 'duplicate' | 'export', number> = {
-  tasks: 220,
+  tasks: 480,
   knowledge: EVENT_POLL_INTERVAL,
   duplicate: EVENT_POLL_INTERVAL,
   export: 400,
@@ -231,7 +231,28 @@ function subscribeEventChannel<TPayload>(channel: 'tasks' | 'knowledge' | 'dupli
 
     try {
       const result = await requestJson<{ events: Array<{ id: number; payload: TPayload }> }>(`/api/events/${channel}?since=${since}`);
-      result.events.forEach((event) => {
+      const events = Array.isArray(result.events) ? result.events : [];
+      if (channel === 'tasks' && events.length > 1) {
+        const latestByTaskKey = new Map<string, { id: number; payload: TPayload }>();
+        events.forEach((event) => {
+          const payload = event.payload as { project_id?: string; task?: { type?: string } } | null;
+          const projectId = String(payload?.project_id || '');
+          const taskType = String(payload?.task?.type || '');
+          const key = `${projectId}:${taskType}`;
+          const current = latestByTaskKey.get(key);
+          if (!current || current.id < event.id) {
+            latestByTaskKey.set(key, event);
+          }
+        });
+        Array.from(latestByTaskKey.values())
+          .sort((a, b) => a.id - b.id)
+          .forEach((event) => {
+            since = Math.max(since, event.id);
+            callback(event.payload);
+          });
+        return;
+      }
+      events.forEach((event) => {
         since = Math.max(since, event.id);
         callback(event.payload);
       });
@@ -472,6 +493,15 @@ function createBridge(): BidMindBridge {
         });
       },
 
+      async importDocumentFile(file: File): Promise<FileImportResult> {
+        const formData = new FormData();
+        formData.append('file', file, file.name);
+        return requestJson(withProjectId('/api/file/import-document'), {
+          method: 'POST',
+          body: formData,
+        });
+      },
+
       async selectDuplicateCheckFiles(options?: { multiple?: boolean }): Promise<FileSelectionResult> {
         const files = await pickLocalFiles({
           multiple: options?.multiple !== false,
@@ -480,6 +510,14 @@ function createBridge(): BidMindBridge {
 
         if (!files?.length) {
           return { success: false, message: '已取消选择', files: [] };
+        }
+
+        return uploadFiles(files);
+      },
+
+      async selectDuplicateCheckFileList(files: File[]): Promise<FileSelectionResult> {
+        if (!files?.length) {
+          return { success: false, message: '未选择文件', files: [] };
         }
 
         return uploadFiles(files);
@@ -525,6 +563,21 @@ function createBridge(): BidMindBridge {
 
         if (!files?.length) {
           return { success: false, message: '已取消选择' };
+        }
+
+        const formData = new FormData();
+        formData.append('folderId', folderId);
+        files.forEach((file) => formData.append('files', file, file.name));
+
+        return requestJson('/api/knowledge/upload-documents', {
+          method: 'POST',
+          body: formData,
+        });
+      },
+
+      async uploadDocumentFiles(folderId: string, files: File[]) {
+        if (!files?.length) {
+          return { success: false, message: '未选择文档' };
         }
 
         const formData = new FormData();

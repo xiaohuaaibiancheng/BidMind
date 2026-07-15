@@ -715,15 +715,6 @@ function ContentEditPage({
           <span className="section-kicker">STEP 04</span>
           <strong>正文生成</strong>
           <p>按目录叶子小节并发生成技术方案正文，页面切换不会中断后台任务。</p>
-          {running && (
-            <div className="step-running-indicator" role="status" aria-live="polite">
-              <span className="inline-spinner" aria-hidden="true" />
-              <div>
-                <strong>{runningHint}</strong>
-                <small>{runningElapsedText || '任务已启动，请稍候...'}</small>
-              </div>
-            </div>
-          )}
         </div>
         <div className="content-generation-stats" aria-label="正文生成统计">
           <span><strong>{leaves.length}</strong> 个小节</span>
@@ -856,15 +847,6 @@ function ContentEditPage({
             </div>
           )}
         </article>
-        {running && (
-          <div className="step-running-overlay" role="status" aria-live="polite">
-            <div className="step-running-overlay-card">
-              <span className="inline-spinner" aria-hidden="true" />
-              <strong>{runningHint}</strong>
-              <small>{runningElapsedText || '任务运行中'}，下方目录和正文会实时刷新</small>
-            </div>
-          </div>
-        )}
       </section>
 
       <Dialog.Root

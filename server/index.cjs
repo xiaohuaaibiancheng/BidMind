@@ -3,19 +3,23 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const crypto = require('node:crypto');
 const Module = require('node:module');
+const mime = require('mime-types');
 const express = require('express');
 const multer = require('multer');
+const { createRuntimeConfig } = require('./infrastructure/runtimeConfig.cjs');
+const { createAuthStore } = require('./infrastructure/authStore.cjs');
+const { createEventStore } = require('./infrastructure/eventStore.cjs');
+const { createBlobStore } = require('./infrastructure/blobStore.cjs');
+const { createStatePersistence } = require('./infrastructure/stateStore.cjs');
 
-const DEFAULT_DATA_ROOT = process.env.VERCEL
-  ? path.join('/tmp', 'bidmind-web-data')
-  : path.join(process.cwd(), '.web-data');
-const DATA_ROOT = path.resolve(process.env.BIDMIND_DATA_ROOT || DEFAULT_DATA_ROOT);
+const RUNTIME_CONFIG = createRuntimeConfig();
+const DATA_ROOT = RUNTIME_CONFIG.app.dataRoot;
 const USERS_ROOT = path.join(DATA_ROOT, 'users');
 const UPLOAD_ROOT = path.join(DATA_ROOT, 'uploads');
 const LEGACY_EXPORT_ROOT = path.join(DATA_ROOT, 'exports');
 const AVATAR_ROOT = path.join(DATA_ROOT, 'avatars');
 const AUTH_FILE = path.join(DATA_ROOT, 'users.json');
-const PORT = Number(process.env.YIBIAO_WEB_API_PORT || 8788);
+const PORT = Number(RUNTIME_CONFIG.app.port || 8788);
 
 fs.mkdirSync(DATA_ROOT, { recursive: true });
 fs.mkdirSync(USERS_ROOT, { recursive: true });
@@ -93,32 +97,20 @@ function normalizeAuthSession(session) {
   };
 }
 
-function readAuthStore() {
-  try {
-    if (!fs.existsSync(AUTH_FILE)) {
-      return { users: [], sessions: [] };
-    }
-    const raw = fs.readFileSync(AUTH_FILE, 'utf-8');
-    const data = JSON.parse(raw);
-    const users = Array.isArray(data.users) ? data.users : [];
-    const userIds = new Set(users.map((item) => String(item?.id || '')));
-    const sessions = Array.isArray(data.sessions)
-      ? data.sessions
-        .map((item) => normalizeAuthSession(item))
-        .filter((item) => item.token && item.user_id && userIds.has(item.user_id))
-      : [];
-    return {
-      users,
-      sessions,
-    };
-  } catch {
-    return { users: [], sessions: [] };
-  }
+const authStore = createAuthStore({
+  runtimeConfig: RUNTIME_CONFIG,
+  authFile: AUTH_FILE,
+  createId,
+  normalizeAuthSession,
+  toIsoTimestamp,
+});
+
+async function readAuthStore() {
+  return authStore.read();
 }
 
-function writeAuthStore(data) {
-  fs.mkdirSync(path.dirname(AUTH_FILE), { recursive: true });
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2), 'utf-8');
+async function writeAuthStore(data) {
+  await authStore.write(data);
 }
 
 function normalizeEmail(value) {
@@ -223,10 +215,10 @@ function trimUserSessions(store, userId, maxCount = 20) {
   store.sessions = store.sessions.filter((item) => item.user_id !== userId || keepTokens.has(item.token));
 }
 
-function findUserByToken(token) {
+async function findUserByToken(token) {
   const safeToken = String(token || '').trim();
   if (!safeToken) return null;
-  const store = readAuthStore();
+  const store = await readAuthStore();
   const session = store.sessions.find((item) => item.token === safeToken);
   if (!session) return null;
   const user = store.users.find((item) => item.id === session.user_id);
@@ -234,7 +226,7 @@ function findUserByToken(token) {
   return { store, user, session: normalizeAuthSession(session), token: safeToken };
 }
 
-function createLocalFileSelection(filePath, originalName) {
+function createLocalFileSelection(filePath, originalName, extra = {}) {
   const stats = fs.statSync(filePath);
   const normalizedName = normalizeUploadedFilename(originalName || path.basename(filePath));
   const extension = path.extname(normalizedName || filePath).toLowerCase();
@@ -245,7 +237,22 @@ function createLocalFileSelection(filePath, originalName) {
     extension,
     size: stats.size,
     modified_at: stats.mtime.toISOString(),
+    ...extra,
   };
+}
+
+function getUserUploadRootById(userId) {
+  const root = userId
+    ? path.join(UPLOAD_ROOT, normalizeUserPathSegment(userId))
+    : path.join(UPLOAD_ROOT, 'anonymous');
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+}
+
+function createUploadBlobKey(userId, selection) {
+  const safeUser = normalizeUserPathSegment(userId || 'anonymous');
+  const safeFileName = sanitizeFilename(selection?.file_name || 'file');
+  return `uploads/${safeUser}/${selection?.id || createId('file')}-${safeFileName}`;
 }
 
 function getAppVersion() {
@@ -270,6 +277,9 @@ function getUserDataRoot(userId) {
 }
 
 function shouldMigrateLegacyData(userId, userDataRoot) {
+  if (RUNTIME_CONFIG.drivers.auth !== 'local') {
+    return false;
+  }
   const hasScopedData = fs.existsSync(path.join(userDataRoot, 'user_config.json'))
     || fs.existsSync(path.join(userDataRoot, 'workspace'));
   if (hasScopedData) {
@@ -279,8 +289,15 @@ function shouldMigrateLegacyData(userId, userDataRoot) {
   if (fs.existsSync(markerPath)) {
     return false;
   }
-  const store = readAuthStore();
-  const users = Array.isArray(store.users) ? store.users : [];
+  let users = [];
+  try {
+    if (fs.existsSync(AUTH_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf-8'));
+      users = Array.isArray(parsed?.users) ? parsed.users : [];
+    }
+  } catch {
+    users = [];
+  }
   if (users.length !== 1) {
     return false;
   }
@@ -392,36 +409,31 @@ const { getGeneratedImagesDir, getImportedImagesDir } = require('../backend-core
 const EVENT_LIMIT = 600;
 const EVENT_CHANNELS = ['tasks', 'knowledge', 'duplicate', 'export'];
 const userServiceContexts = new Map();
+const userServiceContextPromises = new Map();
+const eventStore = createEventStore(RUNTIME_CONFIG, { limit: EVENT_LIMIT });
+const blobStore = createBlobStore(RUNTIME_CONFIG, {
+  localRoot: path.join(DATA_ROOT, 'blob-store'),
+});
+const userStatePersistence = new Map();
 
-function createEventState() {
-  return {
-    seq: {
-      tasks: 0,
-      knowledge: 0,
-      duplicate: 0,
-      export: 0,
-    },
-    items: {
-      tasks: [],
-      knowledge: [],
-      duplicate: [],
-      export: [],
-    },
-  };
+function logRuntimeStorageConfig() {
+  console.log('[bidmind-web-api] storage drivers', {
+    auth: RUNTIME_CONFIG.drivers.auth,
+    state: RUNTIME_CONFIG.drivers.state,
+    blob: RUNTIME_CONFIG.drivers.blob,
+    events: RUNTIME_CONFIG.drivers.events,
+    dataRoot: DATA_ROOT,
+  });
 }
 
-function pushUserEvent(context, channel, payload) {
-  if (!context?.eventState?.items?.[channel]) return;
-  const id = ++context.eventState.seq[channel];
-  context.eventState.items[channel].push({ id, payload });
-  if (context.eventState.items[channel].length > EVENT_LIMIT) {
-    context.eventState.items[channel] = context.eventState.items[channel].slice(-EVENT_LIMIT);
-  }
+async function pushUserEvent(context, channel, payload) {
+  if (!context?.userId || !EVENT_CHANNELS.includes(channel)) return;
+  await eventStore.push(context.userId, channel, payload);
 }
 
-function readUserEvents(context, channel, since = 0) {
-  if (!context?.eventState?.items?.[channel]) return [];
-  return context.eventState.items[channel].filter((item) => item.id > since);
+async function readUserEvents(context, channel, since = 0) {
+  if (!context?.userId || !EVENT_CHANNELS.includes(channel)) return [];
+  return eventStore.read(context.userId, channel, since);
 }
 
 function createBridgeWebContents(context) {
@@ -431,15 +443,15 @@ function createBridgeWebContents(context) {
     },
     send(channel, payload) {
       if (channel === 'tasks:event') {
-        pushUserEvent(context, 'tasks', payload);
+        void pushUserEvent(context, 'tasks', payload);
         return;
       }
       if (channel === 'knowledge-base:event') {
-        pushUserEvent(context, 'knowledge', payload);
+        void pushUserEvent(context, 'knowledge', payload);
         return;
       }
       if (channel === 'duplicate-check:event') {
-        pushUserEvent(context, 'duplicate', payload);
+        void pushUserEvent(context, 'duplicate', payload);
       }
     },
     once() {
@@ -448,16 +460,27 @@ function createBridgeWebContents(context) {
   };
 }
 
-function createUserServiceContext(userId) {
+async function createUserServiceContext(userId) {
   const appShim = createUserAppShim(userId);
-  const configStore = createConfigStore(appShim);
-  const workspaceStore = createWorkspaceStore(appShim);
+  const baseConfigStore = createConfigStore(appShim);
+  const baseWorkspaceStore = createWorkspaceStore(appShim);
+  const statePersistence = createStatePersistence({
+    runtimeConfig: RUNTIME_CONFIG,
+    userId,
+    baseWorkspaceStore,
+    baseConfigStore,
+    logger: console,
+  });
+  await statePersistence.hydrate();
+  const configStore = statePersistence.configStore;
+  const workspaceStore = statePersistence.workspaceStore;
   const aiService = createAiService({ app: appShim, configStore });
   const knowledgeBaseService = createKnowledgeBaseService({ app: appShim, aiService, configStore });
   const duplicateCheckService = createDuplicateCheckService({ app: appShim, configStore, workspaceStore });
   const taskService = createTaskService({ aiService, workspaceStore, knowledgeBaseService });
   const context = {
     userId,
+    runtimeConfig: RUNTIME_CONFIG,
     appShim,
     configStore,
     workspaceStore,
@@ -465,15 +488,15 @@ function createUserServiceContext(userId) {
     knowledgeBaseService,
     duplicateCheckService,
     taskService,
-    eventState: createEventState(),
     exportRoot: appShim.getPath('documents'),
   };
   context.bridgeWebContents = createBridgeWebContents(context);
   taskService.subscribe(context.bridgeWebContents);
+  userStatePersistence.set(userId, statePersistence);
   return context;
 }
 
-function getUserServiceContext(userId) {
+async function getUserServiceContext(userId) {
   const safeUserId = String(userId || '').trim();
   if (!safeUserId) {
     return null;
@@ -482,18 +505,25 @@ function getUserServiceContext(userId) {
   if (cached) {
     return cached;
   }
-  const context = createUserServiceContext(safeUserId);
-  userServiceContexts.set(safeUserId, context);
-  return context;
+  const pending = userServiceContextPromises.get(safeUserId);
+  if (pending) {
+    return pending;
+  }
+  const task = createUserServiceContext(safeUserId)
+    .then((context) => {
+      userServiceContexts.set(safeUserId, context);
+      return context;
+    })
+    .finally(() => {
+      userServiceContextPromises.delete(safeUserId);
+    });
+  userServiceContextPromises.set(safeUserId, task);
+  return task;
 }
 
 function resolveUploadRoot(req) {
   const userId = req?.auth?.user?.id || '';
-  const root = userId
-    ? path.join(UPLOAD_ROOT, normalizeUserPathSegment(userId))
-    : path.join(UPLOAD_ROOT, 'anonymous');
-  fs.mkdirSync(root, { recursive: true });
-  return root;
+  return getUserUploadRootById(userId);
 }
 
 const uploadStorage = multer.diskStorage({
@@ -581,9 +611,9 @@ function getRequestUserContext(req) {
   return req?.userContext || null;
 }
 
-function requireUserContext(req, res, next) {
+async function requireUserContext(req, res, next) {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     res.status(401).json({
       success: false,
@@ -591,7 +621,7 @@ function requireUserContext(req, res, next) {
     });
     return;
   }
-  const context = getUserServiceContext(auth.user.id);
+  const context = await getUserServiceContext(auth.user.id);
   if (!context) {
     res.status(500).json({
       success: false,
@@ -643,6 +673,42 @@ function parseDuplicateHistorySummary(state) {
   };
 }
 
+async function ensureFileSelectionUsableForServer(file, userId) {
+  if (!file || typeof file !== 'object') return file;
+  const currentPath = String(file.file_path || '');
+  if (currentPath && fs.existsSync(currentPath)) {
+    return file;
+  }
+
+  const blobKey = String(file.blob_key || '').trim();
+  if (!blobKey) {
+    return file;
+  }
+
+  const extFromName = path.extname(String(file.file_name || '')).toLowerCase();
+  const ext = extFromName || String(file.extension || '').toLowerCase() || '.bin';
+  const cacheRoot = path.join(getUserUploadRootById(userId), 'blob-cache');
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  const tempPath = path.join(cacheRoot, `${Date.now()}-${crypto.randomUUID()}${ext}`);
+  const buffer = await blobStore.getBuffer(blobKey);
+  await fsp.writeFile(tempPath, buffer);
+  return {
+    ...file,
+    file_path: tempPath,
+  };
+}
+
+async function ensureDuplicatePayloadFiles(payload, userId) {
+  const next = { ...(payload || {}) };
+  if (next.tenderFile) {
+    next.tenderFile = await ensureFileSelectionUsableForServer(next.tenderFile, userId);
+  }
+  if (Array.isArray(next.bidFiles)) {
+    next.bidFiles = await Promise.all(next.bidFiles.map((file) => ensureFileSelectionUsableForServer(file, userId)));
+  }
+  return next;
+}
+
 app.get('/api/version', (_req, res) => {
   res.json({ version: getAppVersion() });
 });
@@ -660,7 +726,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
     return;
   }
 
-  const store = readAuthStore();
+  const store = await readAuthStore();
   if (store.users.some((item) => item.email === email)) {
     res.json({ success: false, message: '该邮箱已注册，请直接登录' });
     return;
@@ -682,7 +748,7 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
   store.users.push(user);
   store.sessions.push(session);
   trimUserSessions(store, user.id);
-  writeAuthStore(store);
+  await writeAuthStore(store);
   res.json({ success: true, token: session.token, user: toPublicUser(user) });
 }));
 
@@ -693,7 +759,7 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
     res.json({ success: false, message: '请输入邮箱和密码' });
     return;
   }
-  const store = readAuthStore();
+  const store = await readAuthStore();
   const user = store.users.find((item) => item.email === email);
   if (!user || user.password_hash !== sha256(password)) {
     res.json({ success: false, message: '邮箱或密码错误' });
@@ -702,7 +768,7 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const session = createSession(user.id, { userAgent: req.headers['user-agent'] });
   store.sessions.push(session);
   trimUserSessions(store, user.id);
-  writeAuthStore(store);
+  await writeAuthStore(store);
   res.json({ success: true, token: session.token, user: toPublicUser(user) });
 }));
 
@@ -712,41 +778,41 @@ app.post('/api/auth/logout', asyncRoute(async (req, res) => {
     res.json({ success: true, message: '已退出登录' });
     return;
   }
-  const store = readAuthStore();
+  const store = await readAuthStore();
   store.sessions = store.sessions.filter((item) => item.token !== token);
-  writeAuthStore(store);
+  await writeAuthStore(store);
   res.json({ success: true, message: '已退出登录' });
 }));
 
 app.post('/api/auth/logout-all', asyncRoute(async (req, res) => {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     res.json({ success: false, message: '登录状态已失效，请重新登录' });
     return;
   }
   auth.store.sessions = auth.store.sessions.filter((item) => item.user_id !== auth.user.id);
-  writeAuthStore(auth.store);
+  await writeAuthStore(auth.store);
   res.json({ success: true, message: '已退出该账号在所有设备上的登录' });
 }));
 
 app.get('/api/auth/me', asyncRoute(async (req, res) => {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     res.json({ user: null });
     return;
   }
   const touchedAt = new Date().toISOString();
   if (touchSession(auth.store, auth.token, touchedAt)) {
-    writeAuthStore(auth.store);
+    await writeAuthStore(auth.store);
   }
   res.json({ user: toPublicUser(auth.user) });
 }));
 
 app.patch('/api/auth/profile', asyncRoute(async (req, res) => {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     res.json({ success: false, message: '登录状态已失效，请重新登录' });
     return;
@@ -763,13 +829,13 @@ app.patch('/api/auth/profile', asyncRoute(async (req, res) => {
   auth.user.phone = String(req.body?.phone ?? auth.user.phone ?? '').trim();
   auth.user.updated_at = new Date().toISOString();
   touchSession(auth.store, auth.token, auth.user.updated_at);
-  writeAuthStore(auth.store);
+  await writeAuthStore(auth.store);
   res.json({ success: true, user: toPublicUser(auth.user) });
 }));
 
 app.post('/api/auth/change-password', asyncRoute(async (req, res) => {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     res.json({ success: false, message: '登录状态已失效，请重新登录' });
     return;
@@ -798,27 +864,27 @@ app.post('/api/auth/change-password', asyncRoute(async (req, res) => {
   auth.user.updated_at = new Date().toISOString();
   auth.store.sessions = auth.store.sessions.filter((item) => item.user_id !== auth.user.id || item.token === auth.token);
   touchSession(auth.store, auth.token, auth.user.updated_at);
-  writeAuthStore(auth.store);
+  await writeAuthStore(auth.store);
   res.json({ success: true, message: '密码修改成功，其他设备已自动退出' });
 }));
 
 app.get('/api/auth/sessions', asyncRoute(async (req, res) => {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     res.json({ success: false, message: '登录状态已失效，请重新登录', sessions: [] });
     return;
   }
   const touchedAt = new Date().toISOString();
   touchSession(auth.store, auth.token, touchedAt);
-  writeAuthStore(auth.store);
+  await writeAuthStore(auth.store);
   const sessions = listUserSessions(auth.store, auth.user.id, auth.token);
   res.json({ success: true, sessions });
 }));
 
 app.post('/api/auth/avatar', avatarUpload.single('avatar'), asyncRoute(async (req, res) => {
   const token = readTokenFromRequest(req);
-  const auth = findUserByToken(token);
+  const auth = await findUserByToken(token);
   if (!auth) {
     if (req.file?.path && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
@@ -839,27 +905,46 @@ app.post('/api/auth/avatar', avatarUpload.single('avatar'), asyncRoute(async (re
     return;
   }
 
+  const nextAvatarName = path.basename(req.file.path);
   if (auth.user.avatar_filename) {
-    const prevPath = path.join(AVATAR_ROOT, auth.user.avatar_filename);
-    if (fs.existsSync(prevPath)) {
-      fs.unlinkSync(prevPath);
-    }
+    await blobStore.remove(`avatars/${auth.user.avatar_filename}`).catch(() => undefined);
   }
-  auth.user.avatar_filename = path.basename(req.file.path);
+
+  await blobStore.putFile(`avatars/${nextAvatarName}`, req.file.path, req.file.mimetype || 'application/octet-stream');
+  if (fs.existsSync(req.file.path)) {
+    fs.unlinkSync(req.file.path);
+  }
+
+  auth.user.avatar_filename = nextAvatarName;
   auth.user.updated_at = new Date().toISOString();
   touchSession(auth.store, auth.token, auth.user.updated_at);
-  writeAuthStore(auth.store);
+  await writeAuthStore(auth.store);
   res.json({ success: true, user: toPublicUser(auth.user) });
 }));
 
 app.get('/api/auth/avatar/:filename', asyncRoute(async (req, res) => {
   const safeName = path.basename(String(req.params.filename || ''));
-  const avatarPath = path.join(AVATAR_ROOT, safeName);
-  if (!safeName || !fs.existsSync(avatarPath)) {
+  if (!safeName) {
     res.status(404).send('avatar not found');
     return;
   }
-  res.sendFile(avatarPath);
+  const key = `avatars/${safeName}`;
+  const exists = await blobStore.exists(key);
+  if (!exists) {
+    const legacyPath = path.join(AVATAR_ROOT, safeName);
+    if (fs.existsSync(legacyPath)) {
+      const legacyContentType = mime.lookup(safeName) || 'application/octet-stream';
+      res.setHeader('Content-Type', String(legacyContentType));
+      res.sendFile(legacyPath);
+      return;
+    }
+    res.status(404).send('avatar not found');
+    return;
+  }
+  const buffer = await blobStore.getBuffer(key);
+  const contentType = mime.lookup(safeName) || 'application/octet-stream';
+  res.setHeader('Content-Type', String(contentType));
+  res.send(buffer);
 }));
 
 app.use('/api', (req, res, next) => {
@@ -871,7 +956,7 @@ app.use('/api', (req, res, next) => {
     next();
     return;
   }
-  requireUserContext(req, res, next);
+  Promise.resolve(requireUserContext(req, res, next)).catch(next);
 });
 
 app.get('/api/config', (req, res) => {
@@ -999,13 +1084,30 @@ app.post('/api/file/import-document', upload.single('file'), asyncRoute(async (r
 }));
 
 app.post('/api/files/register', upload.array('files', 200), asyncRoute(async (req, res) => {
-  getRequestUserContext(req);
+  const context = getRequestUserContext(req);
+  const userId = context?.userId || req?.auth?.user?.id || '';
   const files = Array.isArray(req.files) ? req.files : [];
   const supportedFiles = files.filter((file) => {
     const originalName = normalizeUploadedFilename(file.originalname || file.path);
     return duplicateCheckSupportedExtensions.has(path.extname(originalName || file.path).toLowerCase());
   });
-  const selections = supportedFiles.map((file) => createLocalFileSelection(file.path, normalizeUploadedFilename(file.originalname || path.basename(file.path))));
+  const selections = [];
+  for (const file of supportedFiles) {
+    const selection = createLocalFileSelection(
+      file.path,
+      normalizeUploadedFilename(file.originalname || path.basename(file.path))
+    );
+    if (RUNTIME_CONFIG.drivers.blob === 'minio') {
+      const blobKey = createUploadBlobKey(userId, selection);
+      try {
+        await blobStore.putFile(blobKey, file.path, file.mimetype || 'application/octet-stream');
+        selection.blob_key = blobKey;
+      } catch (error) {
+        console.warn('[bidmind-web-api] 上传文件镜像到 MinIO 失败', error?.message || error);
+      }
+    }
+    selections.push(selection);
+  }
   res.json({
     success: Boolean(selections.length),
     message: selections.length ? `已选择 ${selections.length} 个文件` : (files.length ? '未选择支持的文件类型' : '未选择文件'),
@@ -1272,7 +1374,10 @@ app.get('/api/knowledge/documents/:documentId/analysis', (req, res) => {
 app.post('/api/duplicate/start-metadata-analysis', asyncRoute(async (req, res) => {
   const context = getRequestUserContext(req);
   const projectId = normalizeProjectId(parseProjectId(req));
-  const payload = { ...(req.body || {}), project_id: projectId };
+  const payload = await ensureDuplicatePayloadFiles(
+    { ...(req.body || {}), project_id: projectId },
+    context?.userId || ''
+  );
   const result = await context.duplicateCheckService.startMetadataAnalysis(payload, context.bridgeWebContents);
   res.json(result);
 }));
@@ -1305,7 +1410,7 @@ app.post('/api/export/word', asyncRoute(async (req, res) => {
   const requestId = String(payload.requestId || createId('export'));
   const warnings = [];
 
-  pushUserEvent(context, 'export', {
+  await pushUserEvent(context, 'export', {
     requestId,
     phase: 'running',
     progress: 2,
@@ -1316,7 +1421,7 @@ app.post('/api/export/word', asyncRoute(async (req, res) => {
   const result = await buildDocxResult(payload, {
     warnings,
     onProgress: (event) => {
-      pushUserEvent(context, 'export', {
+      void pushUserEvent(context, 'export', {
         requestId,
         phase: event.phase || 'running',
         progress: event.progress,
@@ -1328,15 +1433,18 @@ app.post('/api/export/word', asyncRoute(async (req, res) => {
 
   const fileName = `${sanitizeFilename(payload.project_name || '标书文档')}.docx`;
   const token = createId('docx');
-  const filePath = path.join(context.exportRoot, `${token}.docx`);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, result.buffer);
+  const exportKey = `exports/${normalizeUserPathSegment(context.userId)}/${token}.docx`;
+  await blobStore.putBuffer(
+    exportKey,
+    result.buffer,
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  );
 
   const message = result.warnings.length
     ? `Word 已导出，但有 ${result.warnings.length} 处图片未能插入，请核对文档。`
     : 'Word 已导出，请核对文档版式。';
 
-  pushUserEvent(context, 'export', {
+  await pushUserEvent(context, 'export', {
     requestId,
     phase: 'success',
     progress: 100,
@@ -1356,16 +1464,18 @@ app.post('/api/export/word', asyncRoute(async (req, res) => {
 app.get('/api/export/download/:token/:fileName?', asyncRoute(async (req, res) => {
   const context = getRequestUserContext(req);
   const token = String(req.params.token || '');
-  const filePath = path.join(context.exportRoot, `${token}.docx`);
-  if (!fs.existsSync(filePath)) {
+  const exportKey = `exports/${normalizeUserPathSegment(context.userId)}/${token}.docx`;
+  const exists = await blobStore.exists(exportKey);
+  if (!exists) {
     res.status(404).json({ message: '文件不存在' });
     return;
   }
 
   const fileName = sanitizeFilename(req.params.fileName || '标书文档.docx');
+  const buffer = await blobStore.getBuffer(exportKey);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`);
-  res.sendFile(filePath);
+  res.send(buffer);
 }));
 
 function resolveAssetPath(appShim, assetUrl) {
@@ -1407,7 +1517,7 @@ app.get('/api/assets', asyncRoute(async (req, res) => {
   res.sendFile(filePath);
 }));
 
-app.get('/api/events/:channel', (req, res) => {
+app.get('/api/events/:channel', asyncRoute(async (req, res) => {
   const context = getRequestUserContext(req);
   const channel = String(req.params.channel || '');
   const since = Number(req.query.since || 0);
@@ -1416,15 +1526,44 @@ app.get('/api/events/:channel', (req, res) => {
     return;
   }
 
-  res.json({ events: readUserEvents(context, channel, Number.isFinite(since) ? since : 0) });
-});
+  const events = await readUserEvents(context, channel, Number.isFinite(since) ? since : 0);
+  res.json({ events });
+}));
 
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
+  if (error?.type === 'request.aborted' || error?.code === 'ECONNABORTED') {
+    console.warn('[bidmind-web-api] request aborted', {
+      method: req?.method,
+      url: req?.originalUrl || req?.url,
+      expected: Number(error?.expected || error?.length || 0),
+      received: Number(error?.received || 0),
+    });
+    if (!res.headersSent) {
+      res.status(499).json({
+        success: false,
+        message: '请求已取消',
+      });
+    }
+    return;
+  }
+
+  if (error?.type === 'entity.too.large') {
+    if (!res.headersSent) {
+      res.status(413).json({
+        success: false,
+        message: '请求体过大，请减少单次提交内容',
+      });
+    }
+    return;
+  }
+
   console.error('[bidmind-web-api] error', error);
-  res.status(500).json({
-    success: false,
-    message: error?.message || '服务器内部错误',
-  });
+  if (!res.headersSent) {
+    res.status(500).json({
+      success: false,
+      message: error?.message || '服务器内部错误',
+    });
+  }
 });
 
 async function cleanupTempExports() {
@@ -1445,12 +1584,20 @@ async function cleanupTempExports() {
   }
 }
 
+async function flushStatePersistenceQueues() {
+  const tasks = Array.from(userStatePersistence.values())
+    .map((item) => (typeof item?.flush === 'function' ? item.flush().catch(() => undefined) : Promise.resolve()));
+  await Promise.all(tasks);
+}
+
 if (require.main === module) {
+  logRuntimeStorageConfig();
   const server = app.listen(PORT, () => {
     console.log(`[bidmind-web-api] listening on http://0.0.0.0:${PORT}`);
   });
 
   process.on('SIGINT', async () => {
+    await flushStatePersistenceQueues();
     await cleanupTempExports();
     server.close(() => {
       process.exit(0);

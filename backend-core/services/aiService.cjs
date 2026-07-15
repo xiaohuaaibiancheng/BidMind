@@ -4,6 +4,9 @@ const crypto = require('node:crypto');
 const { getAiLogsDir, getGeneratedImagesDir } = require('../utils/paths.cjs');
 
 const AI_REQUEST_TIMEOUT_MS = 300000;
+const STREAM_TAIL_CHARS = 2000;
+const MAX_STREAM_LOGGED_EVENTS = 300;
+const MAX_STREAM_LOGGED_CONTENT_CHARS = 300000;
 const ANALYTICS_ENDPOINT = 'https://analytics.agnet.top/track';
 const ANALYTICS_PROJECT_NAME = 'bidmind';
 
@@ -528,25 +531,33 @@ async function streamChatWithConfig(app, config, request, onEvent) {
 
   const requestId = createRequestId();
   let requestBody = createChatRequestBody(config, request, { stream: true });
-  const rawEvents = [];
-  const contentParts = [];
+  const verboseStreamTrace = Boolean(config.developer_mode);
+  const rawEvents = verboseStreamTrace ? [] : null;
+  const contentParts = verboseStreamTrace ? [] : null;
   const startedAt = Date.now();
   let response = null;
   let responseMetadata = null;
   let phase = 'request';
   let ignoredSseLineCount = 0;
   let lastIgnoredSseLine = '';
+  let rawEventCount = 0;
+  let rawEventsDropped = 0;
+  let partialContentChars = 0;
+  let contentCharsDropped = 0;
+  let loggedContentChars = 0;
+  let partialContentTail = '';
 
   function streamStats() {
-    const partialContent = contentParts.join('');
     return {
       phase,
       elapsed_ms: Date.now() - startedAt,
-      raw_event_count: rawEvents.length,
+      raw_event_count: rawEventCount,
+      raw_events_dropped: rawEventsDropped,
       ignored_sse_line_count: ignoredSseLineCount,
       last_ignored_sse_line: lastIgnoredSseLine,
-      partial_content_chars: partialContent.length,
-      partial_content_tail: partialContent.slice(-2000),
+      partial_content_chars: partialContentChars,
+      partial_content_tail: partialContentTail,
+      partial_content_chars_dropped: contentCharsDropped,
       response_meta: responseMetadata,
     };
   }
@@ -607,10 +618,37 @@ async function streamChatWithConfig(app, config, request, onEvent) {
 
       try {
         const data = JSON.parse(payload);
-        rawEvents.push(data);
+        rawEventCount += 1;
+        if (verboseStreamTrace) {
+          if (rawEvents.length < MAX_STREAM_LOGGED_EVENTS) {
+            rawEvents.push(data);
+          } else {
+            rawEventsDropped += 1;
+          }
+        }
         const chunk = data.choices?.[0]?.delta?.content || '';
         if (chunk) {
-          contentParts.push(chunk);
+          partialContentChars += chunk.length;
+          partialContentTail = `${partialContentTail}${chunk}`;
+          if (partialContentTail.length > STREAM_TAIL_CHARS) {
+            partialContentTail = partialContentTail.slice(-STREAM_TAIL_CHARS);
+          }
+
+          if (verboseStreamTrace) {
+            const remain = MAX_STREAM_LOGGED_CONTENT_CHARS - loggedContentChars;
+            if (remain > 0) {
+              const keepChunk = chunk.slice(0, remain);
+              if (keepChunk) {
+                contentParts.push(keepChunk);
+                loggedContentChars += keepChunk.length;
+              }
+              if (keepChunk.length < chunk.length) {
+                contentCharsDropped += chunk.length - keepChunk.length;
+              }
+            } else {
+              contentCharsDropped += chunk.length;
+            }
+          }
           onEvent({ type: 'chunk', chunk });
         }
       } catch {
@@ -641,10 +679,10 @@ async function streamChatWithConfig(app, config, request, onEvent) {
       type: 'stream',
       url: `${trimBaseUrl(config.base_url)}/chat/completions`,
       request: requestBody,
-      response: rawEvents,
+      response: rawEvents || undefined,
       response_meta: responseMetadata,
       diagnostics: streamStats(),
-      content: contentParts.join(''),
+      content: contentParts ? contentParts.join('') : undefined,
       created_at: new Date().toISOString(),
     });
     onEvent({ type: 'done' });
@@ -655,7 +693,7 @@ async function streamChatWithConfig(app, config, request, onEvent) {
       type: 'stream-error',
       url: `${trimBaseUrl(config.base_url)}/chat/completions`,
       request: requestBody,
-      response: rawEvents,
+      response: rawEvents || undefined,
       response_meta: responseMetadata,
       error: message,
       diagnostics: streamStats(),

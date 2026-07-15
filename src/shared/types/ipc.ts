@@ -73,7 +73,9 @@ export interface BidMindBridge {
   };
   file: {
     importDocument: () => Promise<FileImportResult>;
+    importDocumentFile?: (file: File) => Promise<FileImportResult>;
     selectDuplicateCheckFiles: (options?: { multiple?: boolean }) => Promise<FileSelectionResult>;
+    selectDuplicateCheckFileList?: (files: File[]) => Promise<FileSelectionResult>;
   };
   knowledgeBase: {
     list: () => Promise<KnowledgeBaseIndex>;
@@ -82,6 +84,7 @@ export interface BidMindBridge {
     deleteFolder: (folderId: string) => Promise<KnowledgeBaseMutationResult>;
     deleteDocument: (documentId: string) => Promise<KnowledgeBaseMutationResult>;
     uploadDocuments: (folderId: string) => Promise<KnowledgeBaseUploadResult>;
+    uploadDocumentFiles?: (folderId: string, files: File[]) => Promise<KnowledgeBaseUploadResult>;
     startMatching: (documentId: string, batchSize: number) => Promise<KnowledgeBaseStartMatchingResult>;
     readMarkdown: (documentId: string) => Promise<string>;
     readItems: (documentId: string) => Promise<KnowledgeItem[]>;

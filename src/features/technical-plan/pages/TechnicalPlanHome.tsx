@@ -79,6 +79,7 @@ const numberingFormatLabels: Record<ExportNumberingFormat, string> = {
   'lower-letter': '小写字母（a.b.c）',
 };
 const TECHNICAL_PLAN_FLOW_COLLAPSED_KEY = 'bidmind:technical-plan:flow-collapsed:v1';
+const TECHNICAL_RUNNING_OVERLAY_STYLE_KEY = 'bidmind:technical-plan:running-overlay-style:v1';
 
 function loadTechnicalPlanFlowCollapsedPreference() {
   try {
@@ -89,6 +90,15 @@ function loadTechnicalPlanFlowCollapsedPreference() {
     return stored === '1';
   } catch {
     return true;
+  }
+}
+
+function loadRunningOverlayStylePreference(): 'frosted' | 'focus' {
+  try {
+    const stored = localStorage.getItem(TECHNICAL_RUNNING_OVERLAY_STYLE_KEY);
+    return stored === 'focus' ? 'focus' : 'frosted';
+  } catch {
+    return 'frosted';
   }
 }
 
@@ -198,6 +208,22 @@ function normalizeExportStyleOptions(value: ExportStyleOptions | undefined): Exp
   };
 }
 
+function parseTaskStartedAt(task?: BackgroundTaskState): number | null {
+  const parsed = Date.parse(String(task?.started_at || ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatDuration(ms: number) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
 function TechnicalPlanHome() {
   const { state, setState } = useTechnicalPlanWorkflow();
   const { showToast } = useToast();
@@ -206,6 +232,11 @@ function TechnicalPlanHome() {
   const [exportProgress, setExportProgress] = useState<ExportProgressState>(initialExportProgress);
   const [exportSettingsOpen, setExportSettingsOpen] = useState(false);
   const [workflowStageCollapsed, setWorkflowStageCollapsed] = useState(loadTechnicalPlanFlowCollapsedPreference);
+  const [documentImportRunning, setDocumentImportRunning] = useState(false);
+  const [documentImportStartedAt, setDocumentImportStartedAt] = useState<number | null>(null);
+  const [runningOverlayCollapsed, setRunningOverlayCollapsed] = useState(false);
+  const [runningOverlayTick, setRunningOverlayTick] = useState(() => Date.now());
+  const [runningOverlayStyle, setRunningOverlayStyle] = useState<'frosted' | 'focus'>(loadRunningOverlayStylePreference);
   const exportStyleOptions = normalizeExportStyleOptions(state.exportStyleOptions);
   const activeIndex = steps.indexOf(state.step);
   const bidAnalysisReady = Boolean(state.projectOverview && state.techRequirements && state.bidAnalysisProgress === 100);
@@ -225,6 +256,74 @@ function TechnicalPlanHome() {
           ? '当前已经是最后一步'
           : `进入${stepLabels[steps[activeIndex + 1]]}`;
 
+  const runningOverlayInfo = documentImportRunning
+    ? {
+      key: 'document-import',
+      badge: '文件解析',
+      title: '正在解析招标文件',
+      description: '系统正在读取文件并提取正文结构，请稍候。',
+      latestLog: '解析完成后会自动更新到当前页面。',
+      startedAt: documentImportStartedAt,
+    }
+    : state.contentGenerationTask?.status === 'running'
+      ? {
+        key: 'content-generation',
+        badge: '正文生成',
+        title: '正在生成正文内容',
+        description: 'AI 正在按目录叶子小节并发生成正文与图表。',
+        latestLog: trimTaskLogs(state.contentGenerationTask)?.logs?.slice(-1)?.[0] || '正文生成任务正在运行。',
+        startedAt: parseTaskStartedAt(state.contentGenerationTask),
+      }
+      : state.outlineGenerationTask?.status === 'running'
+        ? {
+          key: 'outline-generation',
+          badge: '目录生成',
+          title: '正在生成技术方案目录',
+          description: 'AI 正在抽取评分点并构建目录结构。',
+          latestLog: trimTaskLogs(state.outlineGenerationTask)?.logs?.slice(-1)?.[0] || '目录生成任务正在运行。',
+          startedAt: parseTaskStartedAt(state.outlineGenerationTask),
+        }
+        : state.bidAnalysisTask?.status === 'running'
+          ? {
+            key: 'bid-analysis',
+            badge: '信息解析',
+            title: '正在解析招标文件信息',
+            description: '系统正在提取项目概述、技术要求与关键信息。',
+            latestLog: trimTaskLogs(state.bidAnalysisTask)?.logs?.slice(-1)?.[0] || '招标文件解析任务正在运行。',
+            startedAt: parseTaskStartedAt(state.bidAnalysisTask),
+          }
+          : null;
+  const runningOverlayVisible = Boolean(runningOverlayInfo);
+  const runningOverlayElapsed = runningOverlayInfo?.startedAt
+    ? `已运行 ${formatDuration(Math.max(0, runningOverlayTick - runningOverlayInfo.startedAt))}`
+    : '任务运行中';
+
+  useEffect(() => {
+    if (documentImportRunning) {
+      setDocumentImportStartedAt((prev) => prev ?? Date.now());
+      return;
+    }
+    setDocumentImportStartedAt(null);
+  }, [documentImportRunning]);
+
+  useEffect(() => {
+    if (!runningOverlayVisible) {
+      setRunningOverlayCollapsed(false);
+      return;
+    }
+    setRunningOverlayCollapsed(false);
+  }, [runningOverlayInfo?.key, runningOverlayVisible]);
+
+  useEffect(() => {
+    if (!runningOverlayVisible || runningOverlayCollapsed) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setRunningOverlayTick(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [runningOverlayCollapsed, runningOverlayVisible]);
+
   useEffect(() => {
     try {
       localStorage.setItem(TECHNICAL_PLAN_FLOW_COLLAPSED_KEY, workflowStageCollapsed ? '1' : '0');
@@ -232,6 +331,14 @@ function TechnicalPlanHome() {
       // 忽略本地存储不可用场景
     }
   }, [workflowStageCollapsed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TECHNICAL_RUNNING_OVERLAY_STYLE_KEY, runningOverlayStyle);
+    } catch {
+      // 忽略本地存储不可用场景
+    }
+  }, [runningOverlayStyle]);
 
   const updateExportStyleOptions = (partial: Partial<ExportStyleOptions>) => {
     setState((prev) => ({
@@ -608,7 +715,7 @@ function TechnicalPlanHome() {
   ];
 
   return (
-    <div className="page-stack technical-workbench">
+    <div className={`page-stack technical-workbench${runningOverlayVisible ? ' is-running-focus' : ''}`}>
       {activeProjectName ? (
         <section className="project-context-banner">
           <span className="section-kicker">当前项目</span>
@@ -655,6 +762,7 @@ function TechnicalPlanHome() {
         <DocumentAnalysisPage
           fileName={state.fileName}
           fileContent={state.fileContent}
+          onBusyChange={setDocumentImportRunning}
           onFileImported={(fileName, fileContent) => setState((prev) => ({
             ...prev,
             fileName,

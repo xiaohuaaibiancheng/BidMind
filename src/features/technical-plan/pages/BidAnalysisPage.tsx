@@ -172,6 +172,7 @@ function BidAnalysisPage({
   const [runningHintIndex, setRunningHintIndex] = useState(0);
   const [runningStartedAt, setRunningStartedAt] = useState<number | null>(null);
   const [runningTick, setRunningTick] = useState(() => Date.now());
+  const [focusExpanded, setFocusExpanded] = useState(false);
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [draftTaskContent, setDraftTaskContent] = useState('');
   const { showToast } = useToast();
@@ -232,6 +233,12 @@ function BidAnalysisPage({
   }, [task?.started_at, taskRunning]);
 
   useEffect(() => {
+    if (taskRunning) {
+      setFocusExpanded(true);
+    }
+  }, [taskRunning]);
+
+  useEffect(() => {
     if (!activeTask) {
       setEditingTaskId(null);
       setDraftTaskContent('');
@@ -253,7 +260,8 @@ function BidAnalysisPage({
     try {
       setRunning(true);
       const config = await window.bidmind?.config.load();
-      await window.bidmind?.tasks.startBidAnalysis({ mode, fileContent, real_time_render: true });
+      const shouldRealTimeRender = config?.real_time_render === true;
+      await window.bidmind?.tasks.startBidAnalysis({ mode, fileContent, real_time_render: shouldRealTimeRender });
       trackConfigUsage({ bid_analysis_mode: mode }, config);
       showToast('招标文件解析任务已在后台启动', 'success');
     } catch (error) {
@@ -348,7 +356,7 @@ function BidAnalysisPage({
   };
 
   return (
-    <div className="plan-step-body bid-analysis-page">
+    <div className={`plan-step-body bid-analysis-page${focusExpanded ? ' is-focus-mode' : ''}`}>
       <section className="bid-analysis-command-bar">
         <div>
           <span className="section-kicker">STEP 02</span>
@@ -392,11 +400,16 @@ function BidAnalysisPage({
         </button>
       </section>
 
-      <section className="bid-analysis-workspace">
+      <section className={`bid-analysis-workspace${focusExpanded ? ' is-focus-mode' : ''}`}>
         <aside className="bid-analysis-task-pane" aria-label="解析任务列表">
           <div className="analysis-result-head bid-analysis-task-head">
             <strong>核心信息</strong>
-            <span>{doneCount}/{selectedTasks.length} 项</span>
+            <div className="task-pane-head-actions">
+              <span>{doneCount}/{selectedTasks.length} 项</span>
+              <button type="button" onClick={() => setFocusExpanded((prev) => !prev)}>
+                {focusExpanded ? '恢复原样' : '全屏显示'}
+              </button>
+            </div>
           </div>
           <div className={`content-outline-stats bid-analysis-progress-summary${progressCollapsed ? ' is-collapsed' : ''}`}>
             <button type="button" onClick={() => setProgressCollapsed((prev) => !prev)} aria-expanded={!progressCollapsed}>
@@ -500,15 +513,6 @@ function BidAnalysisPage({
             </div>
           )}
         </article>
-        {taskRunning && (
-          <div className="step-running-overlay" role="status" aria-live="polite">
-            <div className="step-running-overlay-card">
-              <span className="inline-spinner" aria-hidden="true" />
-              <strong>{runningHints[runningHintIndex]}</strong>
-              <small>已运行 {runningElapsedSeconds} 秒，结果会实时显示在当前页面</small>
-            </div>
-          </div>
-        )}
       </section>
     </div>
   );

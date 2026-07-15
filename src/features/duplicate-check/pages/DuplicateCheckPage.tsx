@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import { FloatingToolbar, isLibreOfficeRequiredMessage, MarkdownRenderer, ToolbarArrowLeftIcon, ToolbarArrowRightIcon, useDocumentParseNotice, useToast } from '../../../shared/ui';
 import type { FloatingToolbarGroup } from '../../../shared/ui';
 import type { DuplicateAnalysisStatus, DuplicateAnalysisTabId, DuplicateCheckProjectSummary, DuplicateCheckStep, DuplicateCheckWorkspaceState, DuplicateContentAnalysisState, DuplicateHistoryRecord, DuplicateImageAnalysisState, DuplicateMetadataAnalysisState, DuplicateOutlineAnalysisState, LocalFileSelection } from '../../../shared/types';
@@ -34,6 +34,7 @@ type DuplicateHistoryViewMode = 'current' | 'history';
 type DuplicateHistoryStatusFilter = 'all' | 'success' | 'error' | 'running';
 type DuplicateProjectStatusFilter = 'in-progress' | 'completed' | 'deleted';
 const DUPLICATE_UPLOAD_GUIDE_COLLAPSED_KEY = 'bidmind:duplicate-check:upload-guide-collapsed:v1';
+const DUPLICATE_SUMMARY_FLUSH_INTERVAL_MS = 160;
 const stepLabels: Record<DuplicateCheckStep, string> = {
   management: '查重管理',
   upload: '选择标书',
@@ -89,7 +90,16 @@ function FilePill({ file, onRemove }: { file: LocalFileSelection; onRemove: () =
         <strong title={file.file_name}>{file.file_name}</strong>
         <span>{formatFileSize(file.size)} · {formatDate(file.modified_at)}</span>
       </div>
-      <button type="button" onClick={onRemove} aria-label={`删除 ${file.file_name}`}>删除</button>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          onRemove();
+        }}
+        aria-label={`删除 ${file.file_name}`}
+      >
+        删除
+      </button>
     </article>
   );
 }
@@ -1373,6 +1383,7 @@ function DuplicateCheckPage() {
   const [historyKeyword, setHistoryKeyword] = useState('');
   const [historyStatusFilter, setHistoryStatusFilter] = useState<DuplicateHistoryStatusFilter>('all');
   const [busy, setBusy] = useState<'tender' | 'bid' | null>(null);
+  const [duplicateDragActive, setDuplicateDragActive] = useState<'tender' | 'bid' | null>(null);
   const startedMetadataSignatureRef = useRef<string | null>(null);
   const currentAnalysisSignatureRef = useRef('');
   const openUploadAfterProjectSwitchRef = useRef(false);
@@ -1380,6 +1391,8 @@ function DuplicateCheckPage() {
   const documentParseNoticeIdsRef = useRef(new Set<string>());
   const summaryRunningRef = useRef(new Set<string>());
   const summaryStreamCancelRef = useRef(new Map<string, () => void>());
+  const summaryPendingChunksRef = useRef(new Map<string, string>());
+  const summaryFlushTimersRef = useRef(new Map<string, number>());
   const { showToast } = useToast();
   const { showDocumentParseNotice } = useDocumentParseNotice();
 
@@ -1578,6 +1591,12 @@ function DuplicateCheckPage() {
   );
 
   const cancelSummaryStream = (historyId: string) => {
+    const timer = summaryFlushTimersRef.current.get(historyId);
+    if (timer) {
+      window.clearTimeout(timer);
+      summaryFlushTimersRef.current.delete(historyId);
+    }
+    summaryPendingChunksRef.current.delete(historyId);
     const cancel = summaryStreamCancelRef.current.get(historyId);
     if (cancel) {
       cancel();
@@ -1587,6 +1606,11 @@ function DuplicateCheckPage() {
   };
 
   const cancelAllSummaryStreams = () => {
+    summaryFlushTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    summaryFlushTimersRef.current.clear();
+    summaryPendingChunksRef.current.clear();
     const activeIds = Array.from(summaryStreamCancelRef.current.keys());
     activeIds.forEach((historyId) => {
       summaryStreamCancelRef.current.get(historyId)?.();
@@ -1670,14 +1694,52 @@ function DuplicateCheckPage() {
     }
 
     let completed = false;
+
+    const flushSummaryChunk = () => {
+      const pendingChunk = summaryPendingChunksRef.current.get(target.id);
+      if (!pendingChunk) return;
+      summaryPendingChunksRef.current.delete(target.id);
+      setHistoryRecords((prev) => prev.map((item) => (item.id === target.id
+        ? {
+          ...item,
+          aiSummary: `${item.aiSummary || ''}${pendingChunk}`,
+          aiSummaryStatus: 'running',
+          aiSummaryError: undefined,
+          updated_at: new Date().toISOString(),
+        }
+        : item)));
+    };
+
+    const scheduleSummaryChunkFlush = () => {
+      if (summaryFlushTimersRef.current.has(target.id)) {
+        return;
+      }
+      const timer = window.setTimeout(() => {
+        summaryFlushTimersRef.current.delete(target.id);
+        flushSummaryChunk();
+      }, DUPLICATE_SUMMARY_FLUSH_INTERVAL_MS);
+      summaryFlushTimersRef.current.set(target.id, timer);
+    };
+
+    const clearSummaryChunkFlush = () => {
+      const timer = summaryFlushTimersRef.current.get(target.id);
+      if (timer) {
+        window.clearTimeout(timer);
+        summaryFlushTimersRef.current.delete(target.id);
+      }
+      summaryPendingChunksRef.current.delete(target.id);
+    };
+
     const completeStream = () => {
       if (completed) return;
       completed = true;
+      clearSummaryChunkFlush();
       summaryRunningRef.current.delete(target.id);
       summaryStreamCancelRef.current.delete(target.id);
     };
 
     const handleError = (message?: string) => {
+      flushSummaryChunk();
       completeStream();
       setHistoryRecords((prev) => prev.map((item) => (item.id === target.id
         ? {
@@ -1690,6 +1752,7 @@ function DuplicateCheckPage() {
     };
 
     const handleDone = () => {
+      flushSummaryChunk();
       completeStream();
       setHistoryRecords((prev) => prev.map((item) => {
         if (item.id !== target.id) return item;
@@ -1715,15 +1778,9 @@ function DuplicateCheckPage() {
         if (event.type === 'chunk') {
           const chunk = String(event.chunk || '');
           if (!chunk) return;
-          setHistoryRecords((prev) => prev.map((item) => (item.id === target.id
-            ? {
-              ...item,
-              aiSummary: `${item.aiSummary || ''}${chunk}`,
-              aiSummaryStatus: 'running',
-              aiSummaryError: undefined,
-              updated_at: new Date().toISOString(),
-            }
-            : item)));
+          const pendingChunk = summaryPendingChunksRef.current.get(target.id) || '';
+          summaryPendingChunksRef.current.set(target.id, `${pendingChunk}${chunk}`);
+          scheduleSummaryChunkFlush();
           return;
         }
         if (event.type === 'error') {
@@ -1974,6 +2031,23 @@ function DuplicateCheckPage() {
     return selector({ multiple });
   };
 
+  const selectDroppedFiles = async (files: File[]) => {
+    const selector = window.bidmind?.file?.selectDuplicateCheckFileList;
+    if (typeof selector !== 'function') {
+      throw new Error('当前环境暂不支持拖拽上传，请点击上传按钮选择文件');
+    }
+    return selector(files);
+  };
+
+  const resetDuplicateAnalysis = () => {
+    setMetadataAnalysis(undefined);
+    setOutlineAnalysis(undefined);
+    setContentAnalysis(undefined);
+    setImageAnalysis(undefined);
+    setHistoryViewMode('current');
+    startedMetadataSignatureRef.current = null;
+  };
+
   const uploadTenderFile = async () => {
     try {
       setBusy('tender');
@@ -1988,12 +2062,7 @@ function DuplicateCheckPage() {
         return;
       }
       setTenderFile(result.files[0]);
-      setMetadataAnalysis(undefined);
-      setOutlineAnalysis(undefined);
-      setContentAnalysis(undefined);
-      setImageAnalysis(undefined);
-      setHistoryViewMode('current');
-      startedMetadataSignatureRef.current = null;
+      resetDuplicateAnalysis();
       showToast('招标文件已加入，暂不执行解析', 'success');
     } catch (error) {
       const message = error instanceof Error ? error.message : '选择招标文件失败';
@@ -2028,12 +2097,7 @@ function DuplicateCheckPage() {
       }
       setBidFiles((prev) => [...prev, ...nextFiles]);
       if (nextFiles.length > 0) {
-        setMetadataAnalysis(undefined);
-        setOutlineAnalysis(undefined);
-        setContentAnalysis(undefined);
-        setImageAnalysis(undefined);
-        setHistoryViewMode('current');
-        startedMetadataSignatureRef.current = null;
+        resetDuplicateAnalysis();
         showToast('投标文件已加入，暂不执行解析', 'success');
       }
     } catch (error) {
@@ -2046,6 +2110,74 @@ function DuplicateCheckPage() {
     } finally {
       setBusy(null);
     }
+  };
+
+  const uploadDroppedDuplicateFiles = async (target: 'tender' | 'bid', droppedFiles: File[]) => {
+    const files = droppedFiles.filter((file) => /\.(docx?|wps|pdf|md|markdown)$/i.test(file.name));
+    if (!files.length) {
+      showToast('仅支持 Word / WPS / PDF / Markdown 文件', 'info');
+      return;
+    }
+
+    try {
+      setBusy(target);
+      const result = await selectDroppedFiles(target === 'tender' ? files.slice(0, 1) : files);
+      if (!result?.success || !result.files?.length) {
+        const message = result?.message || '未选择文件';
+        if (isLibreOfficeRequiredMessage(message)) {
+          showDocumentParseNotice(message);
+          return;
+        }
+        showToast(message, message === '已取消选择' ? 'info' : 'error');
+        return;
+      }
+
+      if (target === 'tender') {
+        setTenderFile(result.files[0]);
+        resetDuplicateAnalysis();
+        showToast('招标文件已加入，暂不执行解析', 'success');
+        return;
+      }
+
+      const exists = new Set(bidFiles.map((file) => file.file_path));
+      const nextFiles = result.files.filter((file) => !exists.has(file.file_path));
+      if (nextFiles.length < result.files.length) {
+        showToast('已跳过重复选择的投标文件', 'info');
+      }
+      if (nextFiles.length) {
+        setBidFiles((prev) => [...prev, ...nextFiles]);
+        resetDuplicateAnalysis();
+        showToast('投标文件已加入，暂不执行解析', 'success');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '上传文件失败';
+      if (isLibreOfficeRequiredMessage(message)) {
+        showDocumentParseNotice(message);
+        return;
+      }
+      showToast(message, 'error');
+    } finally {
+      setBusy(null);
+      setDuplicateDragActive(null);
+    }
+  };
+
+  const handleDuplicateDragOver = (target: 'tender' | 'bid') => (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setDuplicateDragActive(target);
+  };
+
+  const handleDuplicateDragLeave = (target: 'tender' | 'bid') => (event: DragEvent<HTMLElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setDuplicateDragActive((current) => (current === target ? null : current));
+    }
+  };
+
+  const handleDuplicateDrop = (target: 'tender' | 'bid') => (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setDuplicateDragActive(null);
+    void uploadDroppedDuplicateFiles(target, Array.from(event.dataTransfer.files || []));
   };
 
   const resetFiles = () => {
@@ -2190,6 +2322,7 @@ function DuplicateCheckPage() {
               <div>
                 <span className="section-kicker">STEP 02</span>
                 <h2>选择标书</h2>
+                <p>拖拽或点击上传文件，系统会在进入下一步后执行元数据、目录、正文和图片查重。</p>
               </div>
               <div className="duplicate-upload-summary">
                 <span>{tenderFile ? '1 份招标文件' : '未上传招标文件'}</span>
@@ -2199,58 +2332,88 @@ function DuplicateCheckPage() {
             </div>
 
             <div className="duplicate-upload-stack">
-              <article className="duplicate-upload-row">
+              <article
+                className={`duplicate-upload-row duplicate-upload-drop-card ${tenderFile ? 'has-files' : ''} ${duplicateDragActive === 'tender' ? 'is-drag-active' : ''}`}
+                onClick={uploadTenderFile}
+                onDragOver={handleDuplicateDragOver('tender')}
+                onDragLeave={handleDuplicateDragLeave('tender')}
+                onDrop={handleDuplicateDrop('tender')}
+              >
                 <div className="duplicate-upload-label">
-                  <span>01</span>
+                  <span className="duplicate-upload-step">01</span>
+                  <i className="duplicate-upload-illustration is-tender" aria-hidden="true" />
                   <strong>招标文件</strong>
                   <small>可选，仅一份</small>
                 </div>
                 <div className="duplicate-upload-content">
                   {tenderFile ? (
-                    <FilePill file={tenderFile} onRemove={() => {
-                      setTenderFile(null);
-                      setMetadataAnalysis(undefined);
-                      setOutlineAnalysis(undefined);
-                      setContentAnalysis(undefined);
-                      setImageAnalysis(undefined);
-                      startedMetadataSignatureRef.current = null;
-                    }} />
+                    <>
+                      <FilePill file={tenderFile} onRemove={() => {
+                        setTenderFile(null);
+                        setMetadataAnalysis(undefined);
+                        setOutlineAnalysis(undefined);
+                        setContentAnalysis(undefined);
+                        setImageAnalysis(undefined);
+                        startedMetadataSignatureRef.current = null;
+                      }} />
+                      <div className="duplicate-upload-continue-hint">
+                        <span aria-hidden="true" />
+                        <strong>点击本卡片可替换招标文件</strong>
+                        <small>也可以直接把新文件拖到这里。</small>
+                      </div>
+                    </>
                   ) : (
-                    <div className="duplicate-empty-upload" />
+                    <button type="button" className="duplicate-empty-upload" disabled={busy !== null}>
+                      <span className="duplicate-empty-upload-icon" aria-hidden="true" />
+                      <strong>拖动招标文件到此处，或点击上传</strong>
+                      <small>用于排除招标文件原文造成的误判，可不上传</small>
+                    </button>
                   )}
                 </div>
-                <button type="button" className="primary-action duplicate-upload-button" onClick={uploadTenderFile} disabled={busy !== null}>
-                  {busy === 'tender' ? '选择中...' : tenderFile ? '替换' : '上传'}
-                </button>
               </article>
 
-              <article className="duplicate-upload-row bid-row">
+              <article
+                className={`duplicate-upload-row duplicate-upload-drop-card bid-row ${bidFiles.length ? 'has-files' : ''} ${duplicateDragActive === 'bid' ? 'is-drag-active' : ''}`}
+                onClick={uploadBidFiles}
+                onDragOver={handleDuplicateDragOver('bid')}
+                onDragLeave={handleDuplicateDragLeave('bid')}
+                onDrop={handleDuplicateDrop('bid')}
+              >
                 <div className="duplicate-upload-label">
-                  <span>02</span>
+                  <span className="duplicate-upload-step">02</span>
+                  <i className="duplicate-upload-illustration is-bid" aria-hidden="true" />
                   <strong>投标文件</strong>
                   <small>必选，可多份</small>
                 </div>
                 <div className="duplicate-upload-content">
                   {bidFiles.length ? (
-                    <div className="duplicate-file-list">
-                      {bidFiles.map((file) => (
-                        <FilePill key={file.file_path} file={file} onRemove={() => {
-                          setBidFiles((prev) => prev.filter((item) => item.file_path !== file.file_path));
-                          setMetadataAnalysis(undefined);
-                          setOutlineAnalysis(undefined);
-                          setContentAnalysis(undefined);
-                          setImageAnalysis(undefined);
-                          startedMetadataSignatureRef.current = null;
-                        }} />
-                      ))}
-                    </div>
+                    <>
+                      <div className="duplicate-file-list">
+                        {bidFiles.map((file) => (
+                          <FilePill key={file.file_path} file={file} onRemove={() => {
+                            setBidFiles((prev) => prev.filter((item) => item.file_path !== file.file_path));
+                            setMetadataAnalysis(undefined);
+                            setOutlineAnalysis(undefined);
+                            setContentAnalysis(undefined);
+                            setImageAnalysis(undefined);
+                            startedMetadataSignatureRef.current = null;
+                          }} />
+                        ))}
+                      </div>
+                      <div className="duplicate-upload-continue-hint">
+                        <span aria-hidden="true" />
+                        <strong>可继续上传投标文件</strong>
+                        <small>点击本卡片继续选择，或把更多标书拖到这里追加。</small>
+                      </div>
+                    </>
                   ) : (
-                    <div className="duplicate-empty-upload" />
+                    <button type="button" className="duplicate-empty-upload" disabled={busy !== null}>
+                      <span className="duplicate-empty-upload-icon" aria-hidden="true" />
+                      <strong>拖动投标文件到此处，或点击批量上传</strong>
+                      <small>支持多份标书同时上传，建议至少 2 份进行查重</small>
+                    </button>
                   )}
                 </div>
-                <button type="button" className="primary-action duplicate-upload-button" onClick={uploadBidFiles} disabled={busy !== null}>
-                  {busy === 'bid' ? '选择中...' : '上传'}
-                </button>
               </article>
             </div>
           </section>

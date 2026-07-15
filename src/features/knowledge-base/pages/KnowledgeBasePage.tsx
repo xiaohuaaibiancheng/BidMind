@@ -1,4 +1,4 @@
-import { Profiler, startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Profiler, startTransition, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import type { Components } from 'react-markdown';
 import { isLibreOfficeRequiredMessage, MarkdownRenderer, useDocumentParseNotice, useToast } from '../../../shared/ui';
@@ -36,6 +36,46 @@ const statusLabels: Record<KnowledgeDocument['status'], string> = {
   success: '完成',
   error: '失败',
 };
+
+const parsingStatuses = new Set<KnowledgeDocument['status']>([
+  'pending',
+  'copying',
+  'converting',
+  'extracting',
+  'ready_for_matching',
+  'matching',
+  'recovering',
+  'analyzing',
+  'saving',
+]);
+
+function isKnowledgeDocumentParsing(document: KnowledgeDocument) {
+  return parsingStatuses.has(document.status);
+}
+
+function getKnowledgeStatusText(document: KnowledgeDocument) {
+  if (!isKnowledgeDocumentParsing(document)) {
+    return statusLabels[document.status];
+  }
+  const progress = Number.isFinite(document.progress) && document.progress > 0
+    ? ` ${Math.round(document.progress)}%`
+    : '';
+  return `正在解析${progress}`;
+}
+
+function formatKnowledgeDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '--';
+  }
+  return date.toLocaleString('zh-CN', {
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
 
 type RenderDebugKind = 'item-source' | 'document-markdown' | 'document-items';
 
@@ -320,6 +360,9 @@ function KnowledgeBasePage() {
   const [usageGuideCollapsed, setUsageGuideCollapsed] = useState(loadUsageGuideCollapsedPreference);
   const [showCreateFolder, setShowCreateFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
+  const [folderKeyword, setFolderKeyword] = useState('');
+  const [folderWorkspaceOpen, setFolderWorkspaceOpen] = useState(false);
+  const [knowledgeDragActive, setKnowledgeDragActive] = useState(false);
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [visibleDocumentCount, setVisibleDocumentCount] = useState(documentRenderBatchSize);
   const autoMatchingIdsRef = useRef(new Set<string>());
@@ -344,6 +387,11 @@ function KnowledgeBasePage() {
   }, [index.documents]);
   const documents = activeFolder ? documentsByFolder.get(activeFolder.id) || emptyDocuments : emptyDocuments;
   const visibleDocuments = documents.slice(0, Math.min(visibleDocumentCount, documents.length));
+  const filteredFolders = useMemo(() => {
+    const keyword = folderKeyword.trim().toLowerCase();
+    if (!keyword) return index.folders;
+    return index.folders.filter((folder) => folder.name.toLowerCase().includes(keyword));
+  }, [folderKeyword, index.folders]);
 
   useEffect(() => {
     void loadInitialData();
@@ -480,6 +528,7 @@ function KnowledgeBasePage() {
       if (!folder) return;
       setIndex((prev) => ({ ...prev, folders: [...prev.folders, folder] }));
       setActiveFolderId(folder.id);
+      setFolderWorkspaceOpen(true);
       setNewFolderName('');
       setShowCreateFolder(false);
       showToast('文件夹已创建', 'success');
@@ -488,6 +537,17 @@ function KnowledgeBasePage() {
     } finally {
       setCreatingFolder(false);
     }
+  };
+
+  const openFolderWorkspace = (folderId: string) => {
+    startTransition(() => {
+      setActiveFolderId(folderId);
+      setFolderWorkspaceOpen(true);
+    });
+  };
+
+  const closeFolderWorkspace = () => {
+    setFolderWorkspaceOpen(false);
   };
 
   const uploadDocuments = async () => {
@@ -522,6 +582,67 @@ function KnowledgeBasePage() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const uploadDocumentFiles = async (files: File[]) => {
+    if (!activeFolder) {
+      showToast('请先创建文件夹', 'info');
+      return;
+    }
+
+    const uploadableFiles = files.filter((file) => /\.(docx?|wps|pdf|md|markdown)$/i.test(file.name));
+    if (!uploadableFiles.length) {
+      showToast('仅支持 Word / PDF / Markdown 文档', 'info');
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const uploadByFiles = window.bidmind?.knowledgeBase.uploadDocumentFiles;
+      const result = uploadByFiles
+        ? await uploadByFiles(activeFolder.id, uploadableFiles)
+        : await window.bidmind?.knowledgeBase.uploadDocuments(activeFolder.id);
+      if (!result?.success) {
+        const message = result?.message || '上传文档失败';
+        if (isLibreOfficeRequiredMessage(message)) {
+          showDocumentParseNotice(message);
+          return;
+        }
+        showToast(message, 'info');
+        return;
+      }
+      if (result.documents?.length) {
+        setIndex((prev) => ({ ...prev, documents: mergeDocuments(prev.documents, result.documents || []) }));
+      }
+      showToast(result.message, 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '上传文档失败';
+      if (isLibreOfficeRequiredMessage(message)) {
+        showDocumentParseNotice(message);
+        return;
+      }
+      showToast(message, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKnowledgeDragOver = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setKnowledgeDragActive(true);
+  };
+
+  const handleKnowledgeDragLeave = (event: DragEvent<HTMLButtonElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setKnowledgeDragActive(false);
+    }
+  };
+
+  const handleKnowledgeDrop = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    setKnowledgeDragActive(false);
+    void uploadDocumentFiles(Array.from(event.dataTransfer.files || []));
   };
 
   const renameFolder = async (folderId: string, currentName: string) => {
@@ -736,164 +857,203 @@ function KnowledgeBasePage() {
   }
 
   return (
-    <div className="page-stack knowledge-page">
-      <section className={`knowledge-usage-guide ${usageGuideCollapsed ? 'is-collapsed' : ''}`}>
-        <button
-          type="button"
-          className="knowledge-usage-guide-toggle"
-          onClick={() => setUsageGuideCollapsed((prev) => !prev)}
-          aria-expanded={!usageGuideCollapsed}
-        >
-          <span className="section-kicker">使用指南</span>
-          <strong>知识库怎么用</strong>
-          <em>{usageGuideCollapsed ? '展开' : '折叠'}</em>
-        </button>
-        {!usageGuideCollapsed && (
-          <div className="knowledge-usage-guide-body">
-            <p>先创建文件夹并上传文档，系统会自动解析为 Markdown，再整理为知识条目，供技术方案和商务标直接复用。</p>
-            <ol>
-              <li>新建文件夹，按项目或主题归档资料。</li>
-              <li>上传 .doc/.docx/.wps/.pdf/.md 文档，等待处理完成。</li>
-              <li>点击“查看条目”核对内容，需要时查看 Markdown 原文。</li>
-            </ol>
-          </div>
-        )}
-      </section>
-
-      <section className="knowledge-workspace-bar">
-        <div className="knowledge-breadcrumb">
-          <span>知识库</span>
-          <strong>{activeFolder?.name || '未选择文件夹'}</strong>
-          <small>{index.folders.length} 个文件夹 / {index.documents.length} 个文档</small>
-        </div>
-        <div className="knowledge-toolbar-actions">
-          <button type="button" className="secondary-action" onClick={() => setShowCreateFolder((value) => !value)}>新建文件夹</button>
-          <button type="button" className="primary-action" onClick={uploadDocuments} disabled={loading || !activeFolder}>
-            {loading ? '处理中...' : '上传文档'}
-          </button>
-        </div>
-      </section>
-
-      {showCreateFolder && (
-        <form
-          className="knowledge-create-folder-bar"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void createFolder();
-          }}
-        >
-          <input
-            autoFocus
-            value={newFolderName}
-            onChange={(event) => setNewFolderName(event.target.value)}
-            placeholder="输入文件夹名称"
-          />
-          <button type="submit" className="primary-action" disabled={creatingFolder}>{creatingFolder ? '创建中...' : '创建'}</button>
-          <button
-            type="button"
-            className="secondary-action"
-            onClick={() => {
-              setNewFolderName('');
-              setShowCreateFolder(false);
-            }}
-          >
-            取消
-          </button>
-        </form>
-      )}
-
-      <section className="knowledge-layout">
-        <aside className="knowledge-folder-panel">
-          <div className="knowledge-panel-head">
-            <strong>文件夹</strong>
-            <span>{index.folders.length} 个</span>
-          </div>
-          {listLoading ? (
-            <div className="knowledge-empty-box">
-              <strong>正在读取知识库...</strong>
-              <p>请稍候，正在加载文件夹和文档列表。</p>
+    <div className={`page-stack knowledge-page ${folderWorkspaceOpen ? 'is-folder-open' : ''}`}>
+      {!folderWorkspaceOpen ? (
+        <>
+          <section className="knowledge-home-head">
+            <div className="knowledge-home-title">
+              <span className="knowledge-home-icon" aria-hidden="true" />
+              <div>
+                <strong>文档知识库</strong>
+                <p>上传项目文件，标书编写时可直接引用</p>
+              </div>
             </div>
-          ) : index.folders.length ? (
-            <div className="knowledge-folder-list">
-              {index.folders.map((folder) => {
-                const count = documentsByFolder.get(folder.id)?.length || 0;
-                return (
-                  <article key={folder.id} className={`knowledge-folder-card ${folder.id === activeFolder?.id ? 'is-active' : ''}`}>
-                    <button type="button" className="knowledge-folder-main" onClick={() => startTransition(() => setActiveFolderId(folder.id))}>
-                      <span aria-hidden="true">F</span>
-                      <strong>{folder.name}</strong>
-                      <small>{count} 个文档</small>
-                    </button>
-                    <div className="knowledge-folder-actions">
-                      <button type="button" onClick={() => void renameFolder(folder.id, folder.name)}>重命名</button>
-                      <button type="button" className="is-danger" onClick={() => void deleteFolder(folder.id, folder.name)}>删除</button>
+
+            <aside className="knowledge-home-stats" aria-label="知识库统计">
+              <div>
+                <strong>文件总数</strong>
+                <span>{index.documents.length}/10个</span>
+                <em><i style={{ width: `${Math.min(index.documents.length / 10 * 100, 100)}%` }} /></em>
+              </div>
+              <div>
+                <strong>存储空间</strong>
+                <span>限时免费</span>
+                <em><i style={{ width: '0%' }} /></em>
+              </div>
+            </aside>
+          </section>
+
+          <section className="knowledge-home-tools">
+            <button type="button" className="primary-action knowledge-create-main-button" onClick={() => setShowCreateFolder((value) => !value)}>新建知识库</button>
+            <label className="knowledge-folder-search">
+              <input
+                value={folderKeyword}
+                onChange={(event) => setFolderKeyword(event.target.value)}
+                placeholder="请输入项目名称"
+                aria-label="搜索知识库"
+              />
+              <span>搜索</span>
+            </label>
+          </section>
+
+          {showCreateFolder && (
+            <form
+              className="knowledge-create-folder-bar"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createFolder();
+              }}
+            >
+              <input
+                autoFocus
+                value={newFolderName}
+                onChange={(event) => setNewFolderName(event.target.value)}
+                placeholder="输入知识库名称"
+              />
+              <button type="submit" className="primary-action" disabled={creatingFolder}>{creatingFolder ? '创建中...' : '创建'}</button>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => {
+                  setNewFolderName('');
+                  setShowCreateFolder(false);
+                }}
+              >
+                取消
+              </button>
+            </form>
+          )}
+
+          <section className="knowledge-home-board">
+            {listLoading ? (
+              <div className="knowledge-empty-box large">
+                <strong>正在读取知识库...</strong>
+                <p>请稍候，正在加载文件夹和文档列表。</p>
+              </div>
+            ) : filteredFolders.length ? (
+              <div className="knowledge-folder-tile-grid">
+                {filteredFolders.map((folder) => {
+                  const folderDocuments = documentsByFolder.get(folder.id) || emptyDocuments;
+                  const count = folderDocuments.length;
+                  const parsingCount = folderDocuments.filter(isKnowledgeDocumentParsing).length;
+                  return (
+                    <article key={folder.id} className="knowledge-folder-tile">
+                      <button type="button" className="knowledge-folder-tile-main" onClick={() => openFolderWorkspace(folder.id)}>
+                        <span className="knowledge-folder-art" aria-hidden="true" />
+                        <strong>{folder.name}</strong>
+                        <small>{count}个文件</small>
+                        {parsingCount > 0 && (
+                          <span className="knowledge-folder-parsing-badge">
+                            <i aria-hidden="true" />
+                            正在解析 {parsingCount}
+                          </span>
+                        )}
+                      </button>
+                      <div className="knowledge-folder-actions">
+                        <button type="button" onClick={() => void renameFolder(folder.id, folder.name)}>重命名</button>
+                        <button type="button" className="is-danger" onClick={() => void deleteFolder(folder.id, folder.name)}>删除</button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="knowledge-empty-box large">
+                <strong>{folderKeyword.trim() ? '没有匹配的知识库' : '还没有知识库'}</strong>
+                <p>{folderKeyword.trim() ? '换一个项目名称试试。' : '点击新建知识库，按项目或主题归档资料。'}</p>
+              </div>
+            )}
+          </section>
+        </>
+      ) : (
+        <>
+          <section className="knowledge-folder-workspace-head">
+            <button type="button" className="secondary-action knowledge-back-button" onClick={closeFolderWorkspace}>返回知识库</button>
+            <div className="knowledge-breadcrumb">
+              <span>当前知识库</span>
+              <strong>{activeFolder?.name || '未选择知识库'}</strong>
+              <small>{documents.length} 个文件</small>
+            </div>
+          </section>
+
+          <section className="knowledge-folder-upload-grid">
+            <button
+              type="button"
+              className={`knowledge-upload-dropzone ${knowledgeDragActive ? 'is-drag-active' : ''}`}
+              onClick={uploadDocuments}
+              onDragOver={handleKnowledgeDragOver}
+              onDragLeave={handleKnowledgeDragLeave}
+              onDrop={handleKnowledgeDrop}
+              disabled={loading || !activeFolder}
+            >
+              <span className="knowledge-upload-folder" aria-hidden="true"><i /></span>
+              <strong>{loading ? '正在处理上传文件' : '拖动文件到此上传 或点击 上传文件'}</strong>
+              <small>单份文件大小上限50MB，仅支持 Word / PDF / Markdown 等文档</small>
+              <em>{loading ? '处理中...' : '上传招标文件'}</em>
+            </button>
+
+            <aside className="knowledge-upload-instructions">
+              <strong>为保证AI可以有效利用知识库内容，请您仔细阅读使用说明</strong>
+              <ol>
+                <li>必须使用 doc 或者 docx 格式文档。</li>
+                <li>仅上传有价值的技术方案、项目报告等，暂不支持商务标解析。</li>
+                <li>文档会按照标题层级解析，建议正文放到二级标题下。</li>
+                <li>一级标题格式支持：【第一章】、【第一篇】、【第一部】、【第一编】、【1】、【一】。</li>
+                <li>二级标题格式支持：【第一节】、【1.1】、【（一）】。</li>
+                <li>团队整体上传文件数量小于等于10，如果想上传更多文件，请联系管理员。</li>
+              </ol>
+            </aside>
+          </section>
+
+          <section className="knowledge-document-table-panel">
+            <div className="knowledge-document-table-head" role="row">
+              <span>序号</span>
+              <span>文件名</span>
+              <span>文件大小</span>
+              <span>上传时间</span>
+              <span>文件状态</span>
+              <span>操作</span>
+            </div>
+            {listLoading ? (
+              <div className="knowledge-empty-box large">
+                <strong>正在读取知识库...</strong>
+                <p>文档列表加载完成后会自动显示。</p>
+              </div>
+            ) : visibleDocuments.length ? (
+              <div className="knowledge-document-table-body">
+                {visibleDocuments.map((document, index) => (
+                  <article className="knowledge-document-table-row" key={document.id}>
+                    <span>{index + 1}</span>
+                    <strong title={document.file_name}>{document.file_name}</strong>
+                    <span>--</span>
+                    <span>{formatKnowledgeDate(document.created_at)}</span>
+                    <span className={`knowledge-status is-${document.status} ${isKnowledgeDocumentParsing(document) ? 'is-parsing' : ''}`}>
+                      {getKnowledgeStatusText(document)}
+                    </span>
+                    <div className="knowledge-document-actions">
+                      {developerMode && <button type="button" onClick={() => void openDocument(document, 'analysis')} disabled={!canOpenAnalysis(document)}>分析调试</button>}
+                      <button type="button" onClick={() => void openDocument(document, 'items')} disabled={document.status !== 'success'}>查看条目</button>
+                      <button type="button" onClick={() => void openDocument(document, 'markdown')} disabled={!canOpenMarkdown(document)}>Markdown</button>
+                      <button type="button" className="is-danger" onClick={() => void deleteDocument(document)}>删除</button>
                     </div>
                   </article>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="knowledge-empty-box">
-              <strong>还没有文件夹</strong>
-              <p>先创建一个文件夹，再上传历史资料。</p>
-            </div>
-          )}
-        </aside>
-
-        <main className="knowledge-document-panel">
-          <div className="knowledge-panel-head">
-            <strong>{activeFolder?.name || '未选择文件夹'}</strong>
-            <span>{documents.length} 个文档</span>
-          </div>
-
-          {listLoading ? (
-            <div className="knowledge-empty-box large">
-              <strong>正在读取知识库...</strong>
-              <p>文档列表加载完成后会自动显示。</p>
-            </div>
-          ) : documents.length ? (
-            <div className="knowledge-document-list">
-              {visibleDocuments.map((document) => (
-                <article className="knowledge-document-card" key={document.id}>
-                  <div className="knowledge-document-title">
-                    <div className="knowledge-document-name">
-                      <strong>{document.file_name}</strong>
-                      {developerMode && <code className="knowledge-entity-id">文档ID：{document.id}</code>}
-                    </div>
-                    <span className={`knowledge-status is-${document.status}`}>{statusLabels[document.status]}</span>
+                ))}
+                {visibleDocuments.length < documents.length && (
+                  <div className="knowledge-empty-box">
+                    <strong>正在加载更多文档...</strong>
+                    <p>已显示 {visibleDocuments.length} / {documents.length} 个文档。</p>
                   </div>
-                  <div className="knowledge-progress-track" aria-label={`处理进度 ${document.progress}%`}>
-                    <span style={{ width: `${Math.max(0, Math.min(100, document.progress || 0))}%` }} />
-                  </div>
-                  <div className="knowledge-document-meta">
-                    <span>{document.message}</span>
-                    <span>{document.item_count || 0} 条知识</span>
-                    <span>{document.candidate_item_count || 0} 个候选</span>
-                    <span>{document.block_count || 0} 个 block</span>
-                  </div>
-                  <div className="knowledge-document-actions">
-                    {developerMode && <button type="button" onClick={() => void openDocument(document, 'analysis')} disabled={!canOpenAnalysis(document)}>分析调试</button>}
-                    <button type="button" onClick={() => void openDocument(document, 'items')} disabled={document.status !== 'success'}>查看条目</button>
-                    <button type="button" onClick={() => void openDocument(document, 'markdown')} disabled={!canOpenMarkdown(document)}>查看 Markdown</button>
-                    <button type="button" className="is-danger" onClick={() => void deleteDocument(document)}>删除</button>
-                  </div>
-                </article>
-              ))}
-              {visibleDocuments.length < documents.length && (
-                <div className="knowledge-empty-box">
-                  <strong>正在加载更多文档...</strong>
-                  <p>已显示 {visibleDocuments.length} / {documents.length} 个文档。</p>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="knowledge-empty-box large">
-              <strong>当前文件夹暂无文档</strong>
-              <p>支持上传 .doc、.docx、.wps、.pdf、.md 文档。</p>
-            </div>
-          )}
-        </main>
-      </section>
+                )}
+              </div>
+            ) : (
+              <div className="knowledge-table-empty">
+                <span aria-hidden="true" />
+                <strong>无数据</strong>
+              </div>
+            )}
+          </section>
+        </>
+      )}
     </div>
   );
 }

@@ -24,6 +24,7 @@ export interface LocalFileSelection {
   id: string;
   file_name: string;
   file_path: string;
+  blob_key?: string;
   extension: string;
   size: number;
   modified_at: string;
